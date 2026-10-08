@@ -998,6 +998,26 @@ function finance_tracker_shortcode_render() {
         .finance-app-wrapper.light .tag-back, .finance-app-wrapper.light .desc-clear { background: rgba(15,23,42,0.08); color: #0f172a; }
         .finance-app-wrapper.light .qt-x { color: #dc2626; }
 
+        /* «بابت چی بود؟»: دسکتاپ داخل فرم، موبایل به صورت شیت پایین */
+        .finance-app-wrapper .desc-dd > .cat-dd-panel.tag-box { display: block; margin: 0 0 15px; padding: 12px; background: rgba(0,0,0,0.18); }
+        .finance-app-wrapper.light .desc-dd > .cat-dd-panel.tag-box { background: rgba(15,23,42,0.04); }
+        .finance-app-wrapper .desc-trigger {
+            display: none; align-items: center; justify-content: space-between; gap: 10px;
+            margin: 0 0 15px; text-align: right; cursor: pointer; color: inherit;
+        }
+        .finance-app-wrapper .desc-trigger > span:first-child { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .finance-app-wrapper .desc-trigger.empty > span:first-child { opacity: 0.6; }
+        .finance-app-wrapper.light .desc-trigger { background: rgba(255,255,255,0.85); color: #0f172a; }
+        .finance-app-wrapper .tag-done { display: none; margin: 12px 0 0; padding: 13px; border: none; font-weight: bold; background: #4ade80; color: #052e16; cursor: pointer; }
+        .finance-app-wrapper.light .tag-done { background: #16a34a; color: #fff; }
+        .finance-app-wrapper .cat-dd-panel.dd-sheet .tag-done { display: block; }
+        .finance-app-wrapper .cat-dd-panel.dd-sheet .tag-grid { max-height: 44vh; }
+        .finance-app-wrapper #add-tag-modal { z-index: 10002; } /* بالای شیت باز شود */
+        @media (max-width: 640px) {
+            .finance-app-wrapper .desc-trigger { display: flex; }
+            .finance-app-wrapper .desc-dd > .cat-dd-panel.tag-box { display: none; }
+        }
+
         /* دکمهٔ ثبت همیشه بالای منوی پایین در دسترس است */
         .finance-app-wrapper #submit-btn {
             position: sticky; bottom: 84px; z-index: 40; margin-top: 4px; padding: 14px;
@@ -1116,7 +1136,14 @@ function finance_tracker_shortcode_render() {
                     <div class="form-group">
                         <input type="text" id="amount" inputmode="numeric" placeholder="مبلغ (تومان)" autocomplete="off">
                     </div>
-                    <div class="tag-box" id="tag-box">
+                    <div class="cat-dd desc-dd" id="tag-dd">
+                    <!-- موبایل: فقط این دکمه در فرم است و موارد آماده به صورت شیت پایین باز می‌شود -->
+                    <button type="button" class="desc-trigger empty" id="tag-dd-btn">
+                        <span id="tag-dd-current">✍️ بابت چی بود؟</span>
+                        <span class="cat-dd-caret">▾</span>
+                    </button>
+                    <div class="cat-dd-panel tag-box" id="tag-box">
+                        <div class="sheet-title"><span>بابت چی بود؟</span><button type="button" class="sheet-close">بستن</button></div>
                         <div class="desc-wrap" id="desc-wrap">
                             <input type="text" id="desc" placeholder="✍️ بابت چی بود؟ بنویسید یا انتخاب کنید" autocomplete="off" enterkeyhint="done">
                             <button type="button" class="desc-clear" id="desc-clear" title="پاک کردن">✕</button>
@@ -1131,6 +1158,8 @@ function finance_tracker_shortcode_render() {
                             <button type="button" class="dd-act" id="tag-add-btn">➕ جدید</button>
                             <button type="button" class="dd-act" id="tag-del-btn">🗑 حذف</button>
                         </div>
+                        <button type="button" class="tag-done" id="tag-done-btn">✓ تأیید</button>
+                    </div>
                     </div>
                     <button type="submit" id="submit-btn">ثبت تراکنش</button>
                 </form>
@@ -1369,6 +1398,7 @@ function finance_tracker_shortcode_render() {
             const MONTHS = ['فروردین','اردیبهشت','خرداد','تیر','مرداد','شهریور','مهر','آبان','آذر','دی','بهمن','اسفند'];
 
             const $ = id => document.getElementById(id);
+            const isMobile = () => window.matchMedia('(max-width: 640px)').matches;
             const appRoot = document.querySelector('.finance-app-wrapper');
             const amountInput = $('amount');
             const descInput = $('desc');
@@ -2160,7 +2190,15 @@ function finance_tracker_shortcode_render() {
             }
 
             function syncDescWrap() {
+                const v = descInput.value.trim();
                 $('desc-wrap').classList.toggle('has-val', descInput.value !== '');
+                $('tag-dd-current').textContent = v || '✍️ بابت چی بود؟';
+                $('tag-dd-btn').classList.toggle('empty', !v);
+            }
+            const descSheetOpen = () => $('tag-dd').classList.contains('open') && isMobile();
+            function openDescSheet() {
+                openDd($('tag-dd'));
+                renderTags();
             }
 
             function resetTagPick() {
@@ -2176,6 +2214,7 @@ function finance_tracker_shortcode_render() {
                 syncDescWrap();
                 setTxType(isIncomeTag(tagText) ? 'income' : 'expense');
                 renderTags();
+                if (descSheetOpen()) closeAllDd(); // روی موبایل با انتخاب، شیت بسته می‌شود
             }
 
             function tileEl(tagText, scope, isGroup) {
@@ -2248,6 +2287,15 @@ function finance_tracker_shortcode_render() {
                 syncDescWrap();
                 renderTags();
                 descInput.focus();
+            });
+            $('tag-dd-btn').addEventListener('click', function(e) {
+                e.stopPropagation();
+                openDescSheet();
+            });
+            $('tag-done-btn').addEventListener('click', closeAllDd);
+            descInput.addEventListener('keydown', function(e) {
+                // داخل شیت، Enter فقط شیت را می‌بندد
+                if (e.key === 'Enter' && descSheetOpen()) { e.preventDefault(); descInput.blur(); closeAllDd(); }
             });
             $('tag-back-btn').addEventListener('click', function() {
                 tagView = 'root';
@@ -2370,7 +2418,11 @@ function finance_tracker_shortcode_render() {
                 const person = currentTab;
 
                 if (amount <= 0) { toast('مبلغ را وارد کنید'); amountInput.focus(); return; }
-                if (!desc) { toast('بنویسید بابت چی بود یا یک مورد آماده انتخاب کنید'); descInput.focus(); return; }
+                if (!desc) {
+                    toast('بنویسید بابت چی بود یا یک مورد آماده انتخاب کنید');
+                    if (isMobile()) openDescSheet(); else descInput.focus();
+                    return;
+                }
 
                 addTransactionLocally(person, type, amount, desc);
                 const mir = transferMirror(person, type, desc);
@@ -2802,7 +2854,6 @@ function finance_tracker_shortcode_render() {
 
             /* ================= کشویی‌ها: پاپ‌اور موبایل + بستن با کلیک بیرون ================= */
             const backdrop = $('sheet-backdrop');
-            const isMobile = () => window.matchMedia('(max-width: 640px)').matches;
 
             // روی موبایل پنل را از دل پنل‌های شیشه‌ای بیرون می‌کشیم تا position:fixed درست کار کند
             let sheetPanel = null, sheetHome = null;
