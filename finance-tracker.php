@@ -8,7 +8,7 @@ add_action('init', 'wp_finance_setup');
 function wp_finance_setup() {
     global $wpdb;
 
-    $db_version = '2';
+    $db_version = '3';
     if (get_option('finance_db_version') !== $db_version) {
         $charset_collate = $wpdb->get_charset_collate();
         require_once( ABSPATH . 'wp-admin/includes/upgrade.php' );
@@ -21,7 +21,9 @@ function wp_finance_setup() {
             amount bigint(20) NOT NULL,
             tx_desc text NOT NULL,
             tx_date date NOT NULL,
-            PRIMARY KEY  (id)
+            client_uid varchar(40) NOT NULL DEFAULT '',
+            PRIMARY KEY  (id),
+            KEY client_uid (client_uid)
         ) $charset_collate;";
         dbDelta($sql1);
 
@@ -60,7 +62,7 @@ function wp_finance_setup() {
 function finance_check_auth() {
     $cookie_secret = hash('sha256', 'finance_auth_secret' . SECURE_AUTH_KEY);
     if(empty($_COOKIE['finance_auth']) || $_COOKIE['finance_auth'] !== $cookie_secret) {
-        wp_send_json_error('دسترسی غیرمجاز');
+        wp_send_json_error('دسترسی غیرمجاز', 401);
     }
 }
 
@@ -140,7 +142,7 @@ function finance_sw_output() {
     header('Service-Worker-Allowed: /');
     header('Cache-Control: no-cache, no-store, must-revalidate');
 
-    $v = 'fin-v1';
+    $v = 'fin-v2';
     ?>
 const CACHE = '<?php echo esc_js($v); ?>';
 
@@ -162,17 +164,23 @@ self.addEventListener('fetch', event => {
     if (url.pathname.indexOf('/wp-admin/') === 0) return;   // admin-ajax و آیکون‌ها
     if (url.searchParams.has('finance_sw')) return;
 
-    // صفحه: اول شبکه، اگر نبود آخرین نسخهٔ کش‌شده
+    // صفحه: اول شبکه؛ اگر نت نبود یا بیش از ۴ ثانیه طول کشید، آخرین نسخهٔ کش‌شده
     if (req.mode === 'navigate' || (req.headers.get('accept') || '').indexOf('text/html') >= 0) {
-        event.respondWith(
-            fetch(req)
-                .then(res => {
-                    const copy = res.clone();
-                    caches.open(CACHE).then(c => c.put(req, copy)).catch(() => {});
-                    return res;
-                })
-                .catch(() => caches.match(req).then(r => r || caches.match(self.location.pathname)))
-        );
+        const fromCache = () => caches.match(req).then(r => r || caches.match(self.location.pathname));
+        const network = fetch(req).then(res => {
+            if (res && res.ok) {
+                const copy = res.clone();
+                caches.open(CACHE).then(c => c.put(req, copy)).catch(() => {});
+            }
+            return res;
+        });
+        event.respondWith(new Promise(resolve => {
+            let done = false;
+            const finish = r => { if (!done && r) { done = true; resolve(r); } };
+            const timer = setTimeout(() => { fromCache().then(finish); }, 4000);
+            network.then(r => { clearTimeout(timer); finish(r); })
+                .catch(() => { clearTimeout(timer); fromCache().then(r => finish(r || Response.error())); });
+        }));
         return;
     }
 
@@ -273,6 +281,87 @@ function delete_finance_transaction() {
         wp_send_json_success();
     }
     wp_send_json_error('شناسه نامعتبر');
+}
+
+/**
+ * ۲-الف. همگام‌سازی دسته‌ای: همهٔ تغییرات صف در یک درخواست و به ترتیب اجرا می‌شوند.
+ * هر تراکنش یک شناسهٔ یکتای سمت کاربر (uid) دارد؛ پس ارسال دوباره هیچ‌وقت تکراری ثبت نمی‌کند
+ * و درخواست می‌تواند با keepalive حتی بعد از بستن اپ هم کامل شود.
+ */
+add_action('wp_ajax_finance_sync', 'finance_sync');
+add_action('wp_ajax_nopriv_finance_sync', 'finance_sync');
+function finance_sync() {
+    finance_check_auth();
+
+    global $wpdb;
+    $table = $wpdb->prefix . 'finance_transactions';
+    $ops = json_decode(isset($_POST['ops']) ? wp_unslash($_POST['ops']) : '', true);
+    if (!is_array($ops)) wp_send_json_error('داده نامعتبر', 400);
+
+    $today = current_time('Y-m-d');
+    $max_date = date('Y-m-d', strtotime($today . ' +1 day'));
+    $resolved = []; // uid => id
+    $results = [];
+
+    foreach (array_slice($ops, 0, 500) as $op) {
+        if (!is_array($op)) { $results[] = ['ok' => false, 'retry' => false]; continue; }
+        $kind = isset($op['kind']) ? (string)$op['kind'] : '';
+        $uid = substr(preg_replace('/[^A-Za-z0-9_-]/', '', isset($op['uid']) ? (string)$op['uid'] : ''), 0, 40);
+        $id = isset($op['id']) ? intval($op['id']) : 0;
+
+        if ($id <= 0 && $uid !== '') {
+            if (isset($resolved[$uid])) {
+                $id = $resolved[$uid];
+            } else {
+                $found = $wpdb->get_var($wpdb->prepare("SELECT id FROM $table WHERE client_uid = %s LIMIT 1", $uid));
+                if ($found) $id = (int)$found;
+            }
+        }
+
+        if ($kind === 'delete') {
+            if ($id > 0) {
+                if ($wpdb->delete($table, ['id' => $id]) === false) { $results[] = ['ok' => false, 'retry' => true]; continue; }
+            }
+            $results[] = ['ok' => true, 'id' => $id];
+            continue;
+        }
+
+        if ($kind !== 'create' && $kind !== 'update') { $results[] = ['ok' => false, 'retry' => false]; continue; }
+
+        $amount = isset($op['amount']) ? intval($op['amount']) : 0;
+        $desc = sanitize_text_field(isset($op['desc']) ? (string)$op['desc'] : '');
+        if ($amount <= 0 || $desc === '') { $results[] = ['ok' => false, 'retry' => false]; continue; }
+        $fields = [
+            'person' => finance_clean_person(isset($op['person']) ? (string)$op['person'] : 'hossein'),
+            'tx_type' => (isset($op['type']) && $op['type'] === 'income') ? 'income' : 'expense',
+            'amount' => $amount,
+            'tx_desc' => $desc,
+        ];
+
+        if ($id > 0) {
+            // ویرایش، یا ساختنی که قبلاً رسیده بود (فقط مقدارها را به‌روز می‌کنیم)
+            if ($wpdb->update($table, $fields, ['id' => $id]) === false) { $results[] = ['ok' => false, 'retry' => true]; continue; }
+            if ($uid !== '') $resolved[$uid] = $id;
+            $date = $wpdb->get_var($wpdb->prepare("SELECT tx_date FROM $table WHERE id = %d", $id));
+            $results[] = ['ok' => true, 'id' => $id, 'date' => $date ? $date : ''];
+            continue;
+        }
+
+        if ($kind === 'update') { $results[] = ['ok' => false, 'retry' => true]; continue; } // هنوز ساخته نشده
+
+        $date = isset($op['date']) ? (string)$op['date'] : '';
+        if (!preg_match('/^(\d{4})-(\d{2})-(\d{2})$/', $date, $m) || !checkdate((int)$m[2], (int)$m[3], (int)$m[1]) || $date > $max_date) {
+            $date = $today;
+        }
+        $fields['tx_date'] = $date;
+        $fields['client_uid'] = $uid;
+        if (!$wpdb->insert($table, $fields)) { $results[] = ['ok' => false, 'retry' => true]; continue; }
+        $id = (int)$wpdb->insert_id;
+        if ($uid !== '') $resolved[$uid] = $id;
+        $results[] = ['ok' => true, 'id' => $id, 'date' => $date];
+    }
+
+    wp_send_json_success(['results' => $results]);
 }
 
 /**
@@ -493,29 +582,7 @@ function finance_tracker_shortcode_render() {
         .finance-app-wrapper summary { padding: 15px; cursor: pointer; font-weight: bold; display: flex; justify-content: space-between; align-items: center; list-style: none; }
         .finance-app-wrapper summary::-webkit-details-marker { display: none; }
         .finance-app-wrapper .day-summary-text { font-size: 0.85rem; opacity: 0.9; }
-        .finance-app-wrapper .transaction-list { padding: 10px 15px; background: rgba(255,255,255,0.05); }
-
-        .finance-app-wrapper .transaction-item { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px dashed rgba(255,255,255,0.1); font-size: 0.9rem; }
-        .finance-app-wrapper .transaction-item:last-child { border-bottom: none; }
-
-        /* ردیف تراکنش: موبایل‌اول و دو خطی؛ متن کامل جا می‌شود */
-        .finance-app-wrapper .tx-info { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 0; padding-left: 8px; }
-        .finance-app-wrapper .tx-desc {
-            min-width: 0; max-width: 100%;
-            display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
-            overflow: hidden; white-space: normal; overflow-wrap: anywhere;
-            font-size: 0.92rem; line-height: 1.55;
-        }
-        .finance-app-wrapper .tx-sub { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; }
-        .finance-app-wrapper .tx-meta { display: flex; align-items: center; gap: 5px; min-width: 0; overflow: hidden; font-size: 0.78rem; opacity: 0.85; }
-        .finance-app-wrapper .tx-meta > * { flex: none; }
-        .finance-app-wrapper .tx-amount { flex: none; white-space: nowrap; font-weight: bold; font-size: 0.95rem; }
-
-        @media (min-width: 560px) {
-            .finance-app-wrapper .tx-info { flex-direction: row; align-items: center; justify-content: space-between; gap: 12px; }
-            .finance-app-wrapper .tx-sub { flex: none; }
-            .finance-app-wrapper .tx-desc { flex: 1; display: block; white-space: nowrap; text-overflow: ellipsis; }
-        }
+        .finance-app-wrapper .transaction-list { padding: 8px; background: rgba(255,255,255,0.03); }
 
         .finance-app-wrapper .tx-actions { display: flex; gap: 5px; flex: none; }
 
@@ -597,7 +664,6 @@ function finance_tracker_shortcode_render() {
         /* ===== ریسپانسیو ===== */
         .finance-app-wrapper .bottom-nav { bottom: 8px; }
         .finance-app-wrapper .glass-panel { max-width: 100%; box-sizing: border-box; }
-        .finance-app-wrapper .tx-info { min-width: 0; }
         @media (max-width: 420px) {
             .finance-app-wrapper .top-row { gap: 6px; }
             .finance-app-wrapper .theme-btn { width: 42px; height: 42px; border-radius: 13px; font-size: 1.1rem; }
@@ -608,7 +674,6 @@ function finance_tracker_shortcode_render() {
             .finance-app-wrapper .action-btn { width: 30px; height: 30px; padding: 5px; }
             .finance-app-wrapper .action-btn svg { width: 16px; height: 16px; }
             .finance-app-wrapper .tx-actions { gap: 4px; }
-            .finance-app-wrapper .transaction-list { padding: 10px 10px; }
             .finance-app-wrapper .nav-btn { font-size: 0.68rem; }
         }
         @media (min-width: 700px) {
@@ -710,7 +775,6 @@ function finance_tracker_shortcode_render() {
         .finance-app-wrapper.light .history-tab.active { background: #fff; }
         .finance-app-wrapper.light details, .finance-app-wrapper.light .stat-item, .finance-app-wrapper.light .person-row, .finance-app-wrapper.light .inst-summary, .finance-app-wrapper.light .inst-item { background: rgba(15,23,42,0.05); }
         .finance-app-wrapper.light .transaction-list { background: rgba(255,255,255,0.55); }
-        .finance-app-wrapper.light .transaction-item { border-bottom-color: rgba(15,23,42,0.12); }
         .finance-app-wrapper.light .balance-sub { border-top-color: rgba(15,23,42,0.12); }
         .finance-app-wrapper.light .action-btn { background: rgba(15,23,42,0.06); border-color: rgba(15,23,42,0.2); color: #0f172a; }
         .finance-app-wrapper.light .action-btn:hover { border-color: rgba(15,23,42,0.7); }
@@ -789,14 +853,12 @@ function finance_tracker_shortcode_render() {
         @keyframes sheet-up { from { transform: translateY(14%); opacity: 0.6; } to { transform: translateY(0); opacity: 1; } }
 
         /* ===== انتخاب چندتایی و جمع انتخاب‌شده‌ها ===== */
-        .finance-app-wrapper .transaction-item { gap: 10px; }
         .finance-app-wrapper .tx-check { width: 21px; height: 21px; flex: none; margin: 0; accent-color: #60a5fa; cursor: pointer; display: none; }
         .finance-app-wrapper.select-mode .tx-check { display: inline-block; }
         .finance-app-wrapper.select-mode .tx-actions { display: none; }
-        .finance-app-wrapper.select-mode .transaction-item { padding: 10px 8px; margin: 2px 0; }
-        .finance-app-wrapper.select-mode .tx-info { padding-left: 0; }
-        .finance-app-wrapper .transaction-item.picked { background: rgba(96,165,250,0.16); border-radius: 12px; box-shadow: inset 0 0 0 1px rgba(96,165,250,0.35); }
-        .finance-app-wrapper.light .transaction-item.picked { background: rgba(37,99,235,0.1); box-shadow: inset 0 0 0 1px rgba(37,99,235,0.3); }
+        .finance-app-wrapper.select-mode .tx-more { display: none; }
+        .finance-app-wrapper .transaction-item.picked { background: rgba(96,165,250,0.16); border-color: rgba(96,165,250,0.45); }
+        .finance-app-wrapper.light .transaction-item.picked { background: rgba(37,99,235,0.1); border-color: rgba(37,99,235,0.35); }
 
         .finance-app-wrapper .select-bar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; }
         .finance-app-wrapper .select-bar .ghost-btn { margin-top: 0; }
@@ -840,9 +902,8 @@ function finance_tracker_shortcode_render() {
         .finance-app-wrapper .net-bar button { width: auto; margin: 0; padding: 5px 11px; font-size: 0.78rem; border-radius: 10px; background: rgba(255,255,255,0.12); color: inherit; cursor: pointer; flex: none; }
         .finance-app-wrapper.light .net-bar button { background: rgba(15,23,42,0.08); }
 
-        .finance-app-wrapper .pending-badge { font-size: 0.68rem; padding: 2px 7px; border-radius: 9px; margin-right: 6px; background: rgba(251,191,36,0.22); color: #fcd34d; white-space: nowrap; }
+        .finance-app-wrapper .pending-badge { font-size: 0.68rem; padding: 2px 7px; border-radius: 9px; background: rgba(251,191,36,0.22); color: #fcd34d; white-space: nowrap; }
         .finance-app-wrapper.light .pending-badge { background: rgba(245,158,11,0.16); color: #92400e; }
-        .finance-app-wrapper .transaction-item.pending { opacity: 0.82; }
 
         /* ===== رویدادها (گروه دوم) ===== */
         .finance-app-wrapper .ev-btn { color: #d8b4fe; }
@@ -851,6 +912,112 @@ function finance_tracker_shortcode_render() {
         .finance-app-wrapper .ev-filter::-webkit-scrollbar { display: none; }
         .finance-app-wrapper .ev-filter .group-chip { flex: none; white-space: nowrap; }
         .finance-app-wrapper .hint-line { font-size: 0.78rem; opacity: 0.7; margin-bottom: 10px; line-height: 1.7; }
+
+        /* ===== ردیف تراکنش (کارت): آیکون | عنوان + توضیح | مبلغ + منو ===== */
+        .finance-app-wrapper .transaction-item {
+            display: flex; align-items: center; gap: 10px;
+            padding: 10px; margin-bottom: 6px; border-radius: 14px;
+            background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.07);
+            font-size: 0.9rem; cursor: pointer; user-select: none;
+            transition: background 0.15s ease, transform 0.12s ease;
+        }
+        .finance-app-wrapper .transaction-item:last-child { margin-bottom: 0; }
+        .finance-app-wrapper .transaction-item:active { transform: scale(0.985); background: rgba(255,255,255,0.09); }
+        .finance-app-wrapper .tx-avatar {
+            flex: none; width: 40px; height: 40px; border-radius: 12px;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 1.2rem; line-height: 1; font-weight: bold;
+        }
+        .finance-app-wrapper .tx-avatar.in { background: rgba(74,222,128,0.16); color: var(--income-color); }
+        .finance-app-wrapper .tx-avatar.out { background: rgba(248,113,113,0.14); color: var(--expense-color); }
+        .finance-app-wrapper .tx-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+        .finance-app-wrapper .tx-desc {
+            font-size: 0.92rem; font-weight: 600; line-height: 1.5;
+            display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+            overflow: hidden; overflow-wrap: anywhere;
+        }
+        .finance-app-wrapper .tx-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; font-size: 0.72rem; opacity: 0.78; }
+        .finance-app-wrapper .tx-meta:empty { display: none; }
+        .finance-app-wrapper .tx-meta .person-badge, .finance-app-wrapper .tx-meta .group-badge { margin: 0; }
+        .finance-app-wrapper .tx-end { flex: none; display: flex; align-items: center; gap: 4px; }
+        .finance-app-wrapper .tx-amount { white-space: nowrap; font-weight: bold; font-size: 0.95rem; }
+        .finance-app-wrapper .tx-more {
+            width: 28px; height: 32px; padding: 0; margin: 0; border: none; border-radius: 9px;
+            background: transparent; color: inherit; opacity: 0.55; cursor: pointer;
+            display: flex; align-items: center; justify-content: center;
+        }
+        .finance-app-wrapper .tx-more svg { width: 18px; height: 18px; }
+        .finance-app-wrapper .transaction-item.pending .tx-amount { opacity: 0.7; }
+        .finance-app-wrapper.light .transaction-item { background: rgba(255,255,255,0.75); border-color: rgba(15,23,42,0.08); }
+        .finance-app-wrapper.light .transaction-item:active { background: rgba(15,23,42,0.06); }
+        .finance-app-wrapper.light .tx-avatar.in { background: rgba(22,163,74,0.12); }
+        .finance-app-wrapper.light .tx-avatar.out { background: rgba(220,38,38,0.1); }
+        .finance-app-wrapper .day-summary-text { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+
+        /* منوی هر ردیف (ویرایش / رویداد / حذف) */
+        .finance-app-wrapper .menu-head { display: flex; align-items: center; gap: 10px; text-align: right; padding-bottom: 14px; margin-bottom: 10px; border-bottom: 1px solid var(--glass-border); }
+        .finance-app-wrapper .menu-head .mh-text { flex: 1; min-width: 0; }
+        .finance-app-wrapper .menu-head .mh-title { font-weight: bold; overflow-wrap: anywhere; }
+        .finance-app-wrapper .menu-head .mh-sub { font-size: 0.78rem; opacity: 0.75; margin-top: 3px; }
+        .finance-app-wrapper .menu-item { display: flex; align-items: center; gap: 10px; margin: 0 0 8px; padding: 13px 14px; border-radius: 13px; background: rgba(255,255,255,0.07); cursor: pointer; font-size: 0.95rem; text-align: right; }
+        .finance-app-wrapper .menu-item.danger { color: #fca5a5; background: rgba(248,113,113,0.12); }
+        .finance-app-wrapper.light .menu-item { background: rgba(15,23,42,0.05); color: #0f172a; }
+        .finance-app-wrapper.light .menu-item.danger { color: #dc2626; background: rgba(220,38,38,0.08); }
+
+        /* ===== موارد آماده: فیلد دستی + دکمه‌های دوتایی ===== */
+        .finance-app-wrapper .tag-box { margin-bottom: 15px; padding: 12px; border-radius: 16px; background: rgba(0,0,0,0.18); border: 1px solid var(--glass-border); }
+        .finance-app-wrapper .tag-box-label { font-size: 0.8rem; opacity: 0.75; margin: 12px 2px 8px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+        .finance-app-wrapper .desc-wrap { position: relative; }
+        .finance-app-wrapper .desc-wrap input { padding-left: 40px; }
+        .finance-app-wrapper .desc-clear { position: absolute; left: 6px; top: 50%; transform: translateY(-50%); width: 30px; height: 30px; padding: 0; margin: 0; border: none; border-radius: 50%; background: rgba(255,255,255,0.12); color: inherit; cursor: pointer; display: none; font-size: 0.8rem; line-height: 30px; }
+        .finance-app-wrapper .desc-wrap.has-val .desc-clear { display: block; }
+        .finance-app-wrapper .tag-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+        .finance-app-wrapper .tag-back { width: auto; margin: 0; padding: 8px 12px; font-size: 0.85rem; border-radius: 11px; background: rgba(255,255,255,0.1); cursor: pointer; flex: none; font-weight: bold; }
+        .finance-app-wrapper .tag-head-title { font-weight: bold; font-size: 0.9rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .finance-app-wrapper .tag-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; max-height: 46vh; overflow-y: auto; padding: 2px; }
+        .finance-app-wrapper .qt {
+            position: relative; display: flex; align-items: center; gap: 8px; min-width: 0;
+            margin: 0; padding: 11px 10px; border-radius: 13px; font-size: 0.86rem; text-align: right;
+            background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.14); color: inherit; cursor: pointer;
+            transition: transform 0.12s ease, background 0.15s ease;
+        }
+        .finance-app-wrapper .qt:active { transform: scale(0.96); }
+        .finance-app-wrapper .qt-icon { flex: none; font-size: 1.15rem; line-height: 1; }
+        .finance-app-wrapper .qt-label { flex: 1; min-width: 0; overflow: hidden; line-height: 1.4; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+        .finance-app-wrapper .qt-go { flex: none; opacity: 0.6; font-size: 1.1rem; line-height: 1; }
+        .finance-app-wrapper .qt.group { background: rgba(251,191,36,0.12); border-color: rgba(251,191,36,0.35); }
+        .finance-app-wrapper .qt.sel { background: rgba(74,222,128,0.2); border-color: rgba(74,222,128,0.6); font-weight: bold; }
+        .finance-app-wrapper .qt.removable { border-color: rgba(248,113,113,0.8); }
+        .finance-app-wrapper .qt-x { position: absolute; top: 3px; left: 6px; font-size: 0.68rem; color: #f87171; }
+        .finance-app-wrapper .tag-empty { grid-column: 1 / -1; text-align: center; font-size: 0.82rem; opacity: 0.7; padding: 10px; }
+        .finance-app-wrapper .tag-box .dd-actions { margin-top: 10px; }
+        .finance-app-wrapper.light .tag-box { background: rgba(15,23,42,0.04); }
+        .finance-app-wrapper.light .qt { background: rgba(255,255,255,0.85); border-color: rgba(15,23,42,0.14); }
+        .finance-app-wrapper.light .qt.group { background: rgba(245,158,11,0.12); border-color: rgba(245,158,11,0.4); }
+        .finance-app-wrapper.light .qt.sel { background: rgba(22,163,74,0.14); border-color: rgba(22,163,74,0.55); }
+        .finance-app-wrapper.light .tag-back, .finance-app-wrapper.light .desc-clear { background: rgba(15,23,42,0.08); color: #0f172a; }
+        .finance-app-wrapper.light .qt-x { color: #dc2626; }
+
+        /* دکمهٔ ثبت همیشه بالای منوی پایین در دسترس است */
+        .finance-app-wrapper #submit-btn {
+            position: sticky; bottom: 84px; z-index: 40; margin-top: 4px; padding: 14px;
+            background: #4ade80; color: #052e16; border: none; font-size: 1.02rem;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+        }
+        .finance-app-wrapper #submit-btn:active { background: #22c55e; }
+        .finance-app-wrapper.light #submit-btn { background: #16a34a; color: #fff; box-shadow: 0 8px 22px rgba(22,163,74,0.3); }
+
+        /* پیام کوتاه «ثبت شد» */
+        .finance-app-wrapper .toast {
+            position: fixed; left: 50%; top: calc(14px + env(safe-area-inset-top, 0px));
+            transform: translate(-50%, -16px); opacity: 0; pointer-events: none;
+            padding: 10px 18px; border-radius: 14px; font-size: 0.88rem; font-weight: bold; white-space: nowrap;
+            background: rgba(15,32,39,0.96); border: 1px solid var(--glass-border); color: #fff;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.4); z-index: 100001;
+            transition: opacity 0.2s ease, transform 0.2s ease;
+        }
+        .finance-app-wrapper .toast.show { opacity: 1; transform: translate(-50%, 0); }
+        .finance-app-wrapper.light .toast { background: #0f172a; }
     </style>
     <?php
 
@@ -887,7 +1054,8 @@ function finance_tracker_shortcode_render() {
             'type' => $row->tx_type,
             'amount' => (int)$row->amount,
             'desc' => $row->tx_desc,
-            'date' => $row->tx_date
+            'date' => $row->tx_date,
+            'uid' => isset($row->client_uid) ? (string)$row->client_uid : ''
         ];
     }
 
@@ -910,6 +1078,7 @@ function finance_tracker_shortcode_render() {
     $tx_json = wp_json_encode($transactions, JSON_HEX_TAG | JSON_HEX_AMP);
     $inst_json = wp_json_encode($installments, JSON_HEX_TAG | JSON_HEX_AMP);
     $ajax_url = admin_url('admin-ajax.php');
+    $server_at = (int) round(microtime(true) * 1000);
     ?>
 
     <div class="finance-app-wrapper">
@@ -937,9 +1106,7 @@ function finance_tracker_shortcode_render() {
 
             <div class="glass-panel" id="form-panel">
                 <h3 id="form-title">ثبت تراکنش</h3>
-                <form id="transaction-form" onsubmit="event.preventDefault(); return false;">
-                    <input type="hidden" id="edit_id" value="0">
-                    <input type="hidden" id="tx_date" value="">
+                <form id="transaction-form" novalidate onsubmit="event.preventDefault(); return false;">
 
                     <div class="toggle-container">
                         <button type="button" class="toggle-btn active" data-value="expense">مخارج</button>
@@ -947,28 +1114,25 @@ function finance_tracker_shortcode_render() {
                     </div>
                     <input type="hidden" id="type" value="expense">
                     <div class="form-group">
-                        <input type="text" id="amount" inputmode="numeric" placeholder="مبلغ (تومان)" required>
+                        <input type="text" id="amount" inputmode="numeric" placeholder="مبلغ (تومان)" autocomplete="off">
                     </div>
-                    <div class="form-group">
-                        <input type="text" id="desc" placeholder="بابت چی بود؟" required>
-                    </div>
-                    <div class="cat-dd" id="tag-dd" style="margin-bottom: 15px;">
-                        <button type="button" class="cat-dd-btn" id="tag-dd-btn">
-                            <span id="tag-dd-current">انتخاب مورد آماده</span>
-                            <span class="cat-dd-caret">▾</span>
-                        </button>
-                        <div class="cat-dd-panel">
-                            <div class="sheet-title"><span>انتخاب مورد آماده</span><button type="button" class="sheet-close">بستن</button></div>
-                            <input type="text" id="tag-search" class="cat-search" placeholder="جستجو...">
-                            <div class="cat-items" id="tag-items"></div>
-                            <div class="dd-actions">
-                                <button type="button" class="dd-act" id="tag-add-btn">➕ جدید</button>
-                                <button type="button" class="dd-act" id="tag-del-btn">🗑 حذف</button>
-                            </div>
+                    <div class="tag-box" id="tag-box">
+                        <div class="desc-wrap" id="desc-wrap">
+                            <input type="text" id="desc" placeholder="✍️ بابت چی بود؟ بنویسید یا انتخاب کنید" autocomplete="off" enterkeyhint="done">
+                            <button type="button" class="desc-clear" id="desc-clear" title="پاک کردن">✕</button>
+                        </div>
+                        <div class="tag-box-label"><span>موارد آماده</span></div>
+                        <div class="tag-head" id="tag-head" style="display:none;">
+                            <button type="button" class="tag-back" id="tag-back-btn">→ بازگشت</button>
+                            <span class="tag-head-title" id="tag-head-title"></span>
+                        </div>
+                        <div class="tag-grid" id="tag-items"></div>
+                        <div class="dd-actions">
+                            <button type="button" class="dd-act" id="tag-add-btn">➕ جدید</button>
+                            <button type="button" class="dd-act" id="tag-del-btn">🗑 حذف</button>
                         </div>
                     </div>
                     <button type="submit" id="submit-btn">ثبت تراکنش</button>
-                    <button type="button" id="cancel-edit-btn" style="display: none;" onclick="window.cancelEdit()">❌ انصراف از ویرایش</button>
                 </form>
             </div>
 
@@ -1169,7 +1333,26 @@ function finance_tracker_shortcode_render() {
             </div>
         </div>
 
+        <!-- منوی هر ردیف تراکنش -->
+        <div class="modal-overlay" id="tx-menu">
+            <div class="modal-box">
+                <div class="menu-head">
+                    <span class="tx-avatar" id="txm-avatar"></span>
+                    <div class="mh-text">
+                        <div class="mh-title" id="txm-title"></div>
+                        <div class="mh-sub" id="txm-sub"></div>
+                    </div>
+                    <b id="txm-amount"></b>
+                </div>
+                <button type="button" class="menu-item" data-act="edit">✏️ ویرایش</button>
+                <button type="button" class="menu-item" data-act="event">🧳 گذاشتن در رویداد</button>
+                <button type="button" class="menu-item danger" data-act="delete">🗑 حذف</button>
+                <button type="button" class="modal-btn cancel" style="width:100%;" onclick="window.closeTxMenu()">بستن</button>
+            </div>
+        </div>
+
         <div class="sheet-backdrop" id="sheet-backdrop"></div>
+        <div class="toast" id="toast"></div>
 
     </div>
 
@@ -1179,22 +1362,41 @@ function finance_tracker_shortcode_render() {
             const plain = new Intl.NumberFormat('fa-IR', { useGrouping: false });
             const fmt = n => formatter.format(n);
             let transactions = <?php echo $tx_json ?: '[]'; ?>;
-            let installments = <?php echo $inst_json ?: '[]'; ?>;
             const ajaxUrl = "<?php echo esc_url($ajax_url); ?>";
+            const SERVER_AT = <?php echo $server_at; ?>;
 
             const PEOPLE = { sarina: 'سارینا', hossein: 'حسین' };
             const MONTHS = ['فروردین','اردیبهشت','خرداد','تیر','مرداد','شهریور','مهر','آبان','آذر','دی','بهمن','اسفند'];
+
+            const $ = id => document.getElementById(id);
+            const appRoot = document.querySelector('.finance-app-wrapper');
+            const amountInput = $('amount');
+            const descInput = $('desc');
+            const typeInput = $('type');
 
             let currentTab = 'sarina';        // sarina | hossein | report
             let currentSection = 'add';       // add | inst | history
             let currentFilter = 'all';
             let currentMonthFilter = '';
-            let itemToDelete = null;          // {kind: 'tx'|'inst', id}
+            let itemToDelete = null;          // {kind: 'tx', id}
             let currentView = 'date';         // date | cat | group
             let selectMode = false;
             let selectedIds = new Set();
             let groupFilter = '';             // فیلتر نمایش بر اساس گروه دوم
             let lastFilteredTx = [];          // آخرین لیست نمایش‌داده‌شده در تاریخچه
+            let accOpen = {};                 // کشوهای باز/بسته، تا بعد از هر ذخیره همان‌طور بمانند
+            let txMenuId = null;
+
+            /* ---------- پیام کوتاه ---------- */
+            let toastTimer = null;
+            function toast(msg) {
+                const el = $('toast');
+                if (!el) return;
+                el.textContent = msg;
+                el.classList.add('show');
+                clearTimeout(toastTimer);
+                toastTimer = setTimeout(() => el.classList.remove('show'), 1800);
+            }
 
             /* ---------- گروه دوم (سفر / پروژه / مناسبت) ---------- */
             const GROUP_KEY = 'finance_tx_groups';
@@ -1218,34 +1420,40 @@ function finance_tracker_shortcode_render() {
 
             const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
-            const ICON_EDIT = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>';
-            const ICON_DEL = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>';
+            const ICON_MORE = '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="2"></circle><circle cx="12" cy="12" r="2"></circle><circle cx="12" cy="19" r="2"></circle></svg>';
 
-            /* یک ردیف تراکنش (مشترک بین نمای روزانه، دسته‌بندی، گروه و اقساط) */
+            /* جدا کردن ایموجی اول متن (🚕 اسنپ ← آیکون + عنوان) */
+            const ICON_RE = /^((?:\p{Extended_Pictographic}|⇄)[️‍\p{Extended_Pictographic}]*)\s*(.*)$/u;
+            function splitIcon(text) {
+                const s = String(text || '').replace('📌 ', '').trim();
+                const m = s.match(ICON_RE);
+                return (m && m[2]) ? { icon: m[1], label: m[2] } : { icon: '', label: s };
+            }
+
+            /* یک ردیف تراکنش (مشترک بین نمای روزانه، دسته‌بندی، رویداد و اقساط) */
             function txRowHtml(item, opts) {
                 opts = opts || {};
-                const isReport = currentTab === 'report';
+                const inc = item.type === 'income';
                 const g = groupOf(item.id);
                 const pend = isPending(item.id);
-                // خط اول: عنوان کامل (در نمای دسته/رویداد که عنوان بالای کشوست، تاریخ)
-                const title = opts.showDesc === false ? dateLabel(item.date) : String(item.desc);
-                // خط دوم: نشان‌ها + مبلغ. در نمای روزانه تاریخ تکراری است، پس نمی‌آید.
-                const meta = (isReport ? '<span class="person-badge ' + esc(item.person) + '">' + esc(PEOPLE[item.person] || '') + '</span>' : '') +
-                    (g ? '<span class="group-badge">🧳 ' + esc(g) + '</span>' : '') +
-                    (pend ? '<span class="pending-badge">⏳ در صف</span>' : '');
-                return '<div class="transaction-item' + (selectedIds.has(item.id) ? ' picked' : '') + (pend ? ' pending' : '') + '" data-tx="' + item.id + '">' +
-                    '<input type="checkbox" class="tx-check" data-check="' + item.id + '"' + (selectedIds.has(item.id) ? ' checked' : '') + '>' +
+                const picked = selectedIds.has(item.id);
+                const parts = splitIcon(item.desc);
+                // در نمای «بر اساس عنوان» و اقساط، عنوان بالای کشوست؛ پس اینجا تاریخ می‌آید
+                const title = opts.showDesc === false ? dateLabel(item.date) : parts.label;
+                const meta = (currentTab === 'report' ? '<span class="person-badge ' + esc(item.person) + '">' + esc(PEOPLE[item.person] || '') + '</span>' : '') +
+                    (opts.showDate ? '<span>' + dateLabel(item.date) + '</span>' : '') +
+                    (g && opts.showGroup !== false ? '<span class="group-badge">🧳 ' + esc(g) + '</span>' : '') +
+                    (pend ? '<span class="pending-badge" title="در حال ذخیره روی سرور">⏳</span>' : '');
+                return '<div class="transaction-item' + (picked ? ' picked' : '') + (pend ? ' pending' : '') + '" data-tx="' + item.id + '">' +
+                    '<input type="checkbox" class="tx-check" data-check="' + item.id + '"' + (picked ? ' checked' : '') + '>' +
+                    '<span class="tx-avatar ' + (inc ? 'in' : 'out') + '">' + (parts.icon ? esc(parts.icon) : (inc ? '▲' : '▼')) + '</span>' +
                     '<div class="tx-info">' +
-                        '<span class="tx-desc" title="' + esc(title) + '">' + esc(title) + '</span>' +
-                        '<div class="tx-sub">' +
-                            '<div class="tx-meta">' + meta + '</div>' +
-                            '<span class="tx-amount ' + (item.type === 'income' ? 'text-green' : 'text-red') + '">' + (item.type === 'income' ? '+' : '-') + fmt(item.amount) + '</span>' +
-                        '</div>' +
+                        '<span class="tx-desc">' + esc(title) + '</span>' +
+                        '<div class="tx-meta">' + meta + '</div>' +
                     '</div>' +
-                    '<div class="tx-actions">' +
-                        '<button type="button" onclick="window.setEvent(' + item.id + ')" class="action-btn ev-btn" title="' + (g ? 'رویداد: ' + esc(g) : 'گذاشتن در یک رویداد') + '">🧳</button>' +
-                        '<button type="button" onclick="window.editTx(' + item.id + ')" class="action-btn" title="ویرایش">' + ICON_EDIT + '</button>' +
-                        '<button type="button" onclick="window.deleteTx(' + item.id + ')" class="action-btn" title="حذف">' + ICON_DEL + '</button>' +
+                    '<div class="tx-end">' +
+                        '<span class="tx-amount ' + (inc ? 'text-green' : 'text-red') + '">' + (inc ? '+' : '-') + fmt(item.amount) + '</span>' +
+                        '<button type="button" class="tx-more" title="گزینه‌ها">' + ICON_MORE + '</button>' +
                     '</div></div>';
             }
 
@@ -1286,6 +1494,13 @@ function finance_tracker_shortcode_render() {
             }
             function pad(n) { return String(n).padStart(2, '0'); }
             function ymd(d) { return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()); }
+            function dayTitle(dateStr) {
+                const now = new Date();
+                const yest = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+                if (dateStr === ymd(now)) return 'امروز، ' + dateLabel(dateStr);
+                if (dateStr === ymd(yest)) return 'دیروز، ' + dateLabel(dateStr);
+                return dateLabel(dateStr);
+            }
             function nowInfo() {
                 const n = new Date();
                 const j = g2j(n.getFullYear(), n.getMonth() + 1, n.getDate());
@@ -1303,23 +1518,53 @@ function finance_tracker_shortcode_render() {
             }
 
             /* ================================================================
-               موتور آفلاین: هر ثبت/ویرایش/حذف اول محلی اعمال می‌شود و در صف
-               localStorage می‌نشیند؛ هر وقت اینترنت بیاید خودش ارسال می‌شود.
+               ذخیره در لحظه + ارسال در پس‌زمینه
+               - هر ثبت/ویرایش/حذف همان لحظه روی صفحه و در localStorage اعمال می‌شود.
+               - صف در یک درخواست دسته‌ای (finance_sync) و با keepalive فرستاده می‌شود،
+                 پس حتی اگر اپ بسته شود درخواست تمام می‌شود.
+               - هر تراکنش uid یکتا دارد؛ ارسال دوباره هیچ‌وقت تکراری ثبت نمی‌کند.
+               - تا سرور تأیید نکند، هیچ موردی از صف پاک نمی‌شود.
                ================================================================ */
             const QUEUE_KEY = 'finance_pending_ops';
             const CACHE_KEY = 'finance_tx_cache';
             let pendingOps = [];
-            let syncing = false;
+            let inflight = 0;
+            let flushAgain = false;
             let lastSyncError = '';
+            let authError = false;
+            let cacheSeen = SERVER_AT;
 
+            function newUid() { return 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10); }
+            function fromP(p) { return p ? { person: p.person, type: p.type, amount: Number(p.amount) || 0, desc: String(p.desc || '') } : {}; }
+            function targetKey(op) { return op.uid ? 'u' + op.uid : 'i' + op.id; }
+
+            function normalizeOp(op) {
+                if (!op || typeof op !== 'object') return null;
+                if (op.v === 2) { delete op._inflight; return op; }
+                // قالب قدیمی صف (قبل از همگام‌سازی دسته‌ای)
+                const pl = op.payload || {};
+                const id = Number(op.id) || 0;
+                if (op.kind === 'delete') return { v: 2, kind: 'delete', id: id, uid: '', at: 0 };
+                if (op.kind !== 'create' && op.kind !== 'update') return null;
+                return { v: 2, kind: op.kind, id: id, uid: op.kind === 'create' ? newUid() : '', date: op.date || '', at: 0,
+                         p: { person: pl.person, type: pl.tx_type, amount: Number(pl.amount) || 0, desc: pl.tx_desc || '' } };
+            }
             function readQueue() {
-                try { const v = JSON.parse(localStorage.getItem(QUEUE_KEY)); return Array.isArray(v) ? v : []; } catch(e) { return []; }
+                try {
+                    const v = JSON.parse(localStorage.getItem(QUEUE_KEY));
+                    return Array.isArray(v) ? v.map(normalizeOp).filter(Boolean) : [];
+                } catch(e) { return []; }
             }
             function saveQueue() {
-                try { localStorage.setItem(QUEUE_KEY, JSON.stringify(pendingOps)); } catch(e) {}
+                try { localStorage.setItem(QUEUE_KEY, JSON.stringify(pendingOps, (k, v) => k === '_inflight' ? undefined : v)); } catch(e) {}
             }
-            function saveCache() {
-                try { localStorage.setItem(CACHE_KEY, JSON.stringify({ at: Date.now(), tx: transactions })); } catch(e) {}
+            function saveCacheNow() {
+                try { localStorage.setItem(CACHE_KEY, JSON.stringify({ at: Date.now(), seen: cacheSeen, tx: transactions })); } catch(e) {}
+            }
+            let cacheTimer = null;
+            function scheduleCacheSave() {
+                clearTimeout(cacheTimer);
+                cacheTimer = setTimeout(saveCacheNow, 400);
             }
             function readCache() {
                 try { const v = JSON.parse(localStorage.getItem(CACHE_KEY)); return (v && Array.isArray(v.tx)) ? v : null; } catch(e) { return null; }
@@ -1327,7 +1572,6 @@ function finance_tracker_shortcode_render() {
 
             let tmpCounter = -1;
             function nextTmpId() { return tmpCounter--; }
-            function isTmp(id) { return id < 0; }
 
             let pendingIds = new Set();
             function refreshPendingIds() {
@@ -1340,93 +1584,158 @@ function finance_tracker_shortcode_render() {
                 pendingOps.push(op);
                 saveQueue();
                 refreshPendingIds();
-                flushQueue();
+                scheduleFlush();
+                setTimeout(renderNetBar, 4500); // اگر طول کشید، نوار وضعیت نشان داده شود
+            }
+            function removeOp(op) {
+                const i = pendingOps.indexOf(op);
+                if (i >= 0) pendingOps.splice(i, 1);
+            }
+            function scheduleFlush() { setTimeout(() => flushQueue(), 0); }
+
+            function opPayload(tx) { return { person: tx.person, type: tx.type, amount: tx.amount, desc: tx.desc }; }
+
+            /* ثبت یا به‌روزرسانی یک تراکنش در صف */
+            function queueUpsert(tx) {
+                const key = tx.uid ? 'u' + tx.uid : 'i' + tx.id;
+                // اگر ساختنش هنوز ارسال نشده، همان را اصلاح کن؛ وگرنه یک ویرایش جدا
+                const waiting = pendingOps.find(o => !o._inflight && (o.kind === 'create' || o.kind === 'update') && targetKey(o) === key);
+                if (waiting) {
+                    waiting.p = opPayload(tx);
+                    saveQueue();
+                    scheduleFlush();
+                } else {
+                    enqueue({ v: 2, kind: 'update', id: tx.id, uid: tx.uid || '', at: Date.now(), p: opPayload(tx) });
+                }
+                scheduleCacheSave();
             }
 
-            function rawPost(obj) {
-                const fd = new URLSearchParams();
-                Object.keys(obj).forEach(k => fd.append(k, obj[k]));
-                return fetch(ajaxUrl, {
-                    method: 'POST',
-                    body: fd,
-                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
-                }).then(res => res.json());
+            function queueDelete(tx) {
+                const key = tx.uid ? 'u' + tx.uid : 'i' + tx.id;
+                // کارهای ارسال‌نشدهٔ همین مورد لازم نیست؛ حذف همیشه فرستاده می‌شود تا اگر قبلاً رسیده بود، پاک شود
+                pendingOps = pendingOps.filter(o => o._inflight || targetKey(o) !== key);
+                enqueue({ v: 2, kind: 'delete', id: tx.id, uid: tx.uid || '', at: Date.now() });
+                scheduleCacheSave();
             }
 
-            function remapId(oldId, newId, newDate) {
+            function remapId(oldId, newId, newDate, uid) {
+                if (!newId) return;
                 const tx = transactions.find(t => t.id === oldId);
-                if (tx) { tx.id = newId; if (newDate) tx.date = newDate; }
-                if (txGroups[oldId]) { txGroups[newId] = txGroups[oldId]; delete txGroups[oldId]; writeGroups(txGroups); }
-                if (selectedIds.has(oldId)) { selectedIds.delete(oldId); selectedIds.add(newId); }
-                pendingOps.forEach(op => { if (op.id === oldId) op.id = newId; if (op.payload && String(op.payload.edit_id) === String(oldId)) op.payload.edit_id = newId; });
+                if (oldId !== newId) {
+                    const dup = transactions.find(t => t.id === newId);
+                    if (tx && dup && dup !== tx) transactions = transactions.filter(t => t !== dup);
+                    if (txGroups[oldId]) { txGroups[newId] = txGroups[oldId]; delete txGroups[oldId]; writeGroups(txGroups); }
+                    if (selectedIds.has(oldId)) { selectedIds.delete(oldId); selectedIds.add(newId); }
+                    pendingOps.forEach(op => { if (op.id === oldId) op.id = newId; });
+                    if (txMenuId === oldId) txMenuId = newId;
+                    if (emTarget && emTarget.id === oldId) emTarget.id = newId;
+                    if (itemToDelete && itemToDelete.id === oldId) itemToDelete.id = newId;
+                    pendingGroupIds = pendingGroupIds.map(x => x === oldId ? newId : x);
+                }
+                if (tx) { tx.id = newId; if (newDate) tx.date = newDate; if (uid) tx.uid = uid; }
             }
 
-            function flushQueue() {
-                if (syncing) return Promise.resolve();
-                if (!pendingOps.length) { renderNetBar(); return Promise.resolve(); }
-                if (typeof navigator !== 'undefined' && navigator.onLine === false) { renderNetBar(); return Promise.resolve(); }
+            function flushQueue(opts) {
+                opts = opts || {};
+                const hiding = !!opts.keepalive;
+                if (!pendingOps.length || (authError && !opts.force)) { renderNetBar(); return; }
+                if (typeof navigator !== 'undefined' && navigator.onLine === false) { renderNetBar(); return; }
+                if (inflight > 0 && !hiding) { flushAgain = true; return; }
 
-                syncing = true;
-                lastSyncError = '';
+                // مواردی که الان در راه‌اند (و هر کار دیگری روی همان تراکنش) صبر می‌کنند تا ترتیب به هم نخورد
+                const busy = new Set();
+                pendingOps.forEach(op => { if (op._inflight) busy.add(targetKey(op)); });
+                const batch = pendingOps.filter(op => !op._inflight && !busy.has(targetKey(op)));
+                if (!batch.length) return;
+
+                batch.forEach(op => { op._inflight = true; });
+                inflight++;
                 renderNetBar();
 
-                const step = () => {
-                    if (!pendingOps.length) return Promise.resolve();
-                    const op = pendingOps[0];
-                    const body = Object.assign({}, op.payload);
-                    if (op.kind === 'create') body.edit_id = 0;
-                    return rawPost(body).then(r => {
-                        if (r && r.success) {
-                            if (op.kind === 'create' && r.data && r.data.id) remapId(op.id, r.data.id, r.data.date);
-                            pendingOps.shift();
-                            saveQueue(); refreshPendingIds();
-                            return step();
-                        }
-                        // سرور جواب داد ولی قبول نکرد: این مورد را دور می‌ریزیم تا صف گیر نکند
-                        pendingOps.shift();
-                        saveQueue(); refreshPendingIds();
-                        lastSyncError = 'یک مورد از طرف سرور رد شد و از صف حذف شد.';
-                        return step();
-                    });
-                };
+                const fd = new URLSearchParams();
+                fd.append('action', 'finance_sync');
+                fd.append('ops', JSON.stringify(batch.map(op => {
+                    const p = op.p || {};
+                    return { kind: op.kind, id: op.id > 0 ? op.id : 0, uid: op.uid || '', date: op.date || '', person: p.person, type: p.type, amount: p.amount, desc: p.desc };
+                })));
+                const bodyStr = fd.toString();
+                let ctrl = null, timer = null;
+                if (!hiding && typeof AbortController !== 'undefined') {
+                    ctrl = new AbortController();
+                    timer = setTimeout(() => ctrl.abort(), 20000);
+                }
 
-                return step()
-                    .catch(() => { lastSyncError = 'اینترنت وصل نشد؛ موارد در صف ماندند.'; })
-                    .finally(() => {
-                        syncing = false;
-                        saveCache();
-                        renderMonthSelect();
-                        updateUI();
+                return fetch(ajaxUrl, {
+                    method: 'POST',
+                    body: bodyStr,
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+                    credentials: 'same-origin',
+                    keepalive: bodyStr.length < 60000,   // با بستن اپ قطع نمی‌شود
+                    signal: ctrl ? ctrl.signal : undefined
+                }).then(res => {
+                    if (res.status === 401 || res.status === 403) { const err = new Error('auth'); err.auth = true; throw err; }
+                    return res.json();
+                }).then(r => {
+                    if (!r || !r.success || !r.data || !Array.isArray(r.data.results)) throw new Error('bad response');
+                    authError = false;
+                    lastSyncError = '';
+                    let dropped = 0;
+                    batch.forEach((op, i) => {
+                        const res = r.data.results[i] || { ok: false, retry: true };
+                        op._inflight = false;
+                        if (res.ok) {
+                            if (op.kind === 'create') remapId(op.id, Number(res.id) || 0, res.date, op.uid);
+                            removeOp(op);
+                        } else if (res.retry && (op.tries = (op.tries || 0) + 1) < 5) {
+                            // دفعهٔ بعد دوباره امتحان می‌شود
+                        } else {
+                            removeOp(op);
+                            dropped++;
+                        }
                     });
+                    if (dropped) toast('⚠️ ' + plain.format(dropped) + ' مورد را سرور نپذیرفت');
+                }).catch(err => {
+                    batch.forEach(op => { op._inflight = false; });
+                    if (err && err.auth) { authError = true; lastSyncError = ''; }
+                    else lastSyncError = 'ارتباط با سرور برقرار نشد؛ خودکار دوباره تلاش می‌شود.';
+                }).finally(() => {
+                    if (timer) clearTimeout(timer);
+                    inflight--;
+                    saveQueue();
+                    refreshPendingIds();
+                    scheduleCacheSave();
+                    updateUI();
+                    if (flushAgain && inflight === 0) {
+                        flushAgain = false;
+                        if (!lastSyncError && !authError) scheduleFlush();
+                    }
+                });
             }
 
             function renderNetBar() {
-                const bar = document.getElementById('net-bar');
-                const txt = document.getElementById('net-bar-text');
+                const bar = $('net-bar');
+                const txt = $('net-bar-text');
+                const btn = $('net-sync-btn');
                 if (!bar || !txt) return;
                 const n = pendingOps.length;
                 const offline = (typeof navigator !== 'undefined' && navigator.onLine === false);
+                const oldest = pendingOps.reduce((m, o) => Math.min(m, o.at || 0), Infinity);
+                const slow = n > 0 && (Date.now() - oldest) > 4000;
                 bar.classList.remove('syncing');
-                if (n === 0 && !offline) { bar.classList.remove('show'); return; }
+                // ارسال عادی چند صدم ثانیه است؛ نوار فقط وقتی مشکلی هست دیده می‌شود
+                if (!offline && !authError && !(n > 0 && (slow || lastSyncError))) { bar.classList.remove('show'); return; }
                 bar.classList.add('show');
-                if (syncing) {
+                if (btn) btn.textContent = authError ? 'ورود دوباره' : 'تلاش مجدد';
+                if (authError) {
+                    txt.textContent = '🔒 ' + plain.format(n) + ' مورد روی گوشی ذخیره شده؛ برای ارسال دوباره وارد شوید';
+                } else if (offline) {
+                    txt.textContent = n ? '📴 آفلاین — ' + plain.format(n) + ' مورد روی گوشی ذخیره شده و با وصل‌شدن نت خودکار ارسال می‌شود' : '📴 آفلاین — تغییرات روی گوشی ذخیره می‌شود';
+                } else if (inflight) {
                     bar.classList.add('syncing');
                     txt.textContent = 'در حال ارسال ' + plain.format(n) + ' مورد...';
-                } else if (offline) {
-                    txt.textContent = n ? '📴 آفلاین — ' + plain.format(n) + ' مورد ذخیره شده، با وصل‌شدن نت ارسال می‌شود' : '📴 آفلاین — تغییرات ذخیره می‌شود';
                 } else {
                     txt.textContent = '⏳ ' + plain.format(n) + ' مورد در صف ارسال' + (lastSyncError ? ' — ' + lastSyncError : '');
                 }
-            }
-
-            function post(obj) {
-                const fd = new URLSearchParams();
-                Object.keys(obj).forEach(k => fd.append(k, obj[k]));
-                return fetch(ajaxUrl, {
-                    method: 'POST',
-                    body: fd,
-                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
-                }).then(res => res.json());
             }
 
             function visibleTx() {
@@ -1435,7 +1744,7 @@ function finance_tracker_shortcode_render() {
 
             /* ---------- فیلتر ماه (شمسی) ---------- */
             function renderMonthSelect() {
-                const select = document.getElementById('month-filter');
+                const select = $('month-filter');
                 const currentValue = currentMonthFilter;
 
                 const months = new Set();
@@ -1456,7 +1765,7 @@ function finance_tracker_shortcode_render() {
                 if (!available.includes(currentValue)) currentMonthFilter = '';
             }
 
-            document.getElementById('month-filter').addEventListener('change', (e) => {
+            $('month-filter').addEventListener('change', (e) => {
                 currentMonthFilter = e.target.value;
                 updateUI();
             });
@@ -1478,8 +1787,7 @@ function finance_tracker_shortcode_render() {
             });
 
             /* ---------- حالت روشن / تیره ---------- */
-            const appRoot = document.querySelector('.finance-app-wrapper');
-            const themeBtn = document.getElementById('theme-toggle');
+            const themeBtn = $('theme-toggle');
             const THEME_SUN = '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"></circle><line x1="12" y1="2" x2="12" y2="4"></line><line x1="12" y1="20" x2="12" y2="22"></line><line x1="4.93" y1="4.93" x2="6.34" y2="6.34"></line><line x1="17.66" y1="17.66" x2="19.07" y2="19.07"></line><line x1="2" y1="12" x2="4" y2="12"></line><line x1="20" y1="12" x2="22" y2="12"></line><line x1="4.93" y1="19.07" x2="6.34" y2="17.66"></line><line x1="17.66" y1="6.34" x2="19.07" y2="4.93"></line></svg>';
             const THEME_MOON = '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>';
             function syncThemeBtn() {
@@ -1495,7 +1803,7 @@ function finance_tracker_shortcode_render() {
             syncThemeBtn();
 
             /* ---------- تمام‌صفحه ---------- */
-            const fsBtn = document.getElementById('fs-toggle');
+            const fsBtn = $('fs-toggle');
             const fsRoot = document.documentElement;
             const reqFs = fsRoot.requestFullscreen || fsRoot.webkitRequestFullscreen;
             const exitFs = document.exitFullscreen || document.webkitExitFullscreen;
@@ -1527,7 +1835,7 @@ function finance_tracker_shortcode_render() {
                 const personOnly = s => (s === 'add');
                 Object.keys(SECTION_PANELS).forEach(s => {
                     SECTION_PANELS[s].forEach(id => {
-                        document.getElementById(id).style.display = (s === currentSection && !(isReport && personOnly(s))) ? 'block' : 'none';
+                        $(id).style.display = (s === currentSection && !(isReport && personOnly(s))) ? 'block' : 'none';
                     });
                 });
                 document.querySelectorAll('.nav-btn[data-section]').forEach(b => {
@@ -1540,6 +1848,8 @@ function finance_tracker_shortcode_render() {
             function setSection(sec) {
                 currentSection = sec;
                 applyView();
+                renderNow();
+                try { appRoot.scrollTo({ top: 0 }); } catch(e) { appRoot.scrollTop = 0; }
             }
 
             document.querySelectorAll('.nav-btn[data-section]').forEach(btn => {
@@ -1547,16 +1857,17 @@ function finance_tracker_shortcode_render() {
             });
 
             /* ---------- خروج با تأیید ---------- */
-            document.getElementById('nav-logout-btn').addEventListener('click', () => {
-                document.getElementById('logout-modal').classList.add('active');
+            $('nav-logout-btn').addEventListener('click', () => {
+                $('logout-modal').classList.add('active');
             });
             window.closeLogoutModal = function() {
-                document.getElementById('logout-modal').classList.remove('active');
+                $('logout-modal').classList.remove('active');
             };
-            document.getElementById('confirm-logout-btn').addEventListener('click', function() {
+            $('confirm-logout-btn').addEventListener('click', function() {
                 this.textContent = 'در حال خروج...';
                 this.disabled = true;
-                document.getElementById('logout-form').submit();
+                saveCacheNow();
+                $('logout-form').submit();
             });
 
             function formTitleText() {
@@ -1571,18 +1882,50 @@ function finance_tracker_shortcode_render() {
                 // با هر تعویض تب، به «ثبت تراکنش» برمی‌گردیم (در گزارش کل که ثبت ندارد، «تراکنش ها»)
                 currentSection = isReport ? 'history' : 'add';
                 applyView();
-                document.getElementById('person-breakdown').style.display = isReport ? 'block' : 'none';
-                document.getElementById('balance-label').textContent = isReport ? 'موجودی کل (حسین + سارینا)' : 'موجودی ' + PEOPLE[tab];
-                document.getElementById('history-title').textContent = isReport ? 'تاریخچه کل' : 'تاریخچه ' + PEOPLE[tab];
+                $('person-breakdown').style.display = isReport ? 'block' : 'none';
+                $('balance-label').textContent = isReport ? 'موجودی کل (حسین + سارینا)' : 'موجودی ' + PEOPLE[tab];
+                $('history-title').textContent = isReport ? 'تاریخچه کل' : 'تاریخچه ' + PEOPLE[tab];
 
                 currentMonthFilter = '';
                 groupFilter = '';
                 selectedIds.clear();
-                window.cancelEdit();
-                renderTags();
-                renderMonthSelect();
-                updateUI();
+                resetForm();
+                renderNow();
             }
+
+            /* ---------- منوی هر ردیف ---------- */
+            function openTxMenu(id) {
+                const tx = transactions.find(t => t.id === id);
+                if (!tx) return;
+                txMenuId = id;
+                const inc = tx.type === 'income';
+                const parts = splitIcon(tx.desc);
+                const g = groupOf(id);
+                const av = $('txm-avatar');
+                av.className = 'tx-avatar ' + (inc ? 'in' : 'out');
+                av.textContent = parts.icon || (inc ? '▲' : '▼');
+                $('txm-title').textContent = parts.label;
+                $('txm-sub').textContent = [dateLabel(tx.date), PEOPLE[tx.person] || '', g ? '🧳 ' + g : '', isPending(id) ? '⏳ در حال ذخیره' : ''].filter(Boolean).join('  |  ');
+                const am = $('txm-amount');
+                am.className = inc ? 'text-green' : 'text-red';
+                am.textContent = (inc ? '+' : '-') + fmt(tx.amount);
+                $('tx-menu').classList.add('active');
+            }
+            window.closeTxMenu = function() {
+                txMenuId = null;
+                $('tx-menu').classList.remove('active');
+            };
+            document.querySelectorAll('#tx-menu .menu-item').forEach(b => {
+                b.addEventListener('click', () => {
+                    const id = txMenuId;
+                    const act = b.getAttribute('data-act');
+                    window.closeTxMenu();
+                    if (id === null) return;
+                    if (act === 'edit') window.editTx(id);
+                    else if (act === 'event') window.setEvent(id);
+                    else if (act === 'delete') window.deleteTx(id);
+                });
+            });
 
             /* ---------- ویرایش / حذف تراکنش ---------- */
             window.editTx = function(id) {
@@ -1591,12 +1934,12 @@ function finance_tracker_shortcode_render() {
                 openEditModal('tx', tx);
             };
 
-            /* ---------- مودال ویرایش (تراکنش و قسط) ---------- */
-            const emModal = document.getElementById('edit-modal');
-            const emAmount = document.getElementById('em-amount');
-            const emDesc = document.getElementById('em-desc');
-            const emRoutine = document.getElementById('em-routine');
-            const emSave = document.getElementById('em-save-btn');
+            /* ---------- مودال ویرایش ---------- */
+            const emModal = $('edit-modal');
+            const emAmount = $('em-amount');
+            const emDesc = $('em-desc');
+            const emRoutine = $('em-routine');
+            const emSave = $('em-save-btn');
             let emTarget = null;
             let emType = 'expense';
 
@@ -1607,7 +1950,15 @@ function finance_tracker_shortcode_render() {
             document.querySelectorAll('#em-type-wrap .toggle-btn').forEach(b => {
                 b.addEventListener('click', () => setEmType(b.getAttribute('data-value')));
             });
+
+            function bindAmountFormat(el) {
+                el.addEventListener('input', function(e) {
+                    const parsed = parsePersianInt(e.target.value);
+                    e.target.value = parsed > 0 ? fmt(parsed) : '';
+                });
+            }
             bindAmountFormat(emAmount);
+            bindAmountFormat(amountInput);
 
             let emCats = [];
             let emCatKey = '';
@@ -1628,13 +1979,13 @@ function finance_tracker_shortcode_render() {
                 emCatKey = normText(currentDesc);
 
                 closeAllDd();
-                document.getElementById('em-cat-search').value = '';
-                document.getElementById('em-cat-current').textContent = currentDesc || 'انتخاب دسته';
+                $('em-cat-search').value = '';
+                $('em-cat-current').textContent = currentDesc || 'انتخاب دسته';
                 renderCatItems('');
             }
 
             function renderCatItems(filter) {
-                const box = document.getElementById('em-cat-items');
+                const box = $('em-cat-items');
                 if (!box) return;
                 const f = normText(filter);
                 const list = f ? emCats.filter(c => c.key.indexOf(f) >= 0) : emCats;
@@ -1650,7 +2001,7 @@ function finance_tracker_shortcode_render() {
                     el.addEventListener('click', () => {
                         emCatKey = c.key;
                         emDesc.value = c.label;
-                        document.getElementById('em-cat-current').textContent = c.label;
+                        $('em-cat-current').textContent = c.label;
                         closeAllDd();
                         renderCatItems('');
                     });
@@ -1660,32 +2011,32 @@ function finance_tracker_shortcode_render() {
 
             function openEditModal(kind, item) {
                 emTarget = { kind: kind, id: item.id };
-                const isTx = kind === 'tx';
-                document.getElementById('em-type-wrap').style.display = isTx ? 'flex' : 'none';
-                document.getElementById('em-routine-wrap').style.display = isTx ? 'none' : 'flex';
-                document.getElementById('em-cat-wrap').style.display = isTx ? 'block' : 'none';
-                document.getElementById('edit-modal-title').textContent = (isTx ? 'ویرایش تراکنش ' : 'ویرایش قسط ') + (PEOPLE[item.person] || '');
+                $('em-type-wrap').style.display = 'flex';
+                $('em-routine-wrap').style.display = 'none';
+                $('em-cat-wrap').style.display = 'block';
+                $('edit-modal-title').textContent = 'ویرایش تراکنش ' + (PEOPLE[item.person] || '');
                 emAmount.value = fmt(item.amount);
-                emDesc.value = isTx ? item.desc : item.title;
-                emDesc.placeholder = isTx ? 'بابت چی بود؟' : 'عنوان قسط';
-                if (isTx) { setEmType(item.type); fillEmCats(item.desc); } else emRoutine.checked = !!item.routine;
+                emDesc.value = item.desc;
+                emDesc.placeholder = 'بابت چی بود؟';
+                setEmType(item.type);
+                fillEmCats(item.desc);
                 emModal.classList.add('active');
             }
 
-            document.getElementById('em-cat-btn').addEventListener('click', function(e) {
+            $('em-cat-btn').addEventListener('click', function(e) {
                 e.stopPropagation();
-                const dd = document.getElementById('em-cat-dd');
+                const dd = $('em-cat-dd');
                 if (dd.classList.contains('open')) { closeAllDd(); return; }
                 openDd(dd);
-                const se = document.getElementById('em-cat-search');
+                const se = $('em-cat-search');
                 se.value = '';
                 renderCatItems('');
                 if (!isMobile()) se.focus();
             });
-            document.getElementById('em-cat-search').addEventListener('input', function() {
+            $('em-cat-search').addEventListener('input', function() {
                 renderCatItems(this.value);
             });
-            document.getElementById('em-cat-search').addEventListener('keydown', function(e) {
+            $('em-cat-search').addEventListener('keydown', function(e) {
                 if (e.key === 'Enter') e.preventDefault();
             });
 
@@ -1699,95 +2050,44 @@ function finance_tracker_shortcode_render() {
                 if (!emTarget) return;
                 const amount = parsePersianInt(emAmount.value);
                 const text = emDesc.value.trim();
-                if (amount <= 0 || !text) { alert('مبلغ و عنوان را وارد کنید'); return; }
+                if (amount <= 0 || !text) { toast('مبلغ و عنوان را وارد کنید'); return; }
 
-                const t = emTarget;
-                emSave.disabled = true;
-                emSave.textContent = 'در حال ذخیره...';
-
-                if (t.kind === 'tx') {
-                    const tx = transactions.find(x => x.id === t.id);
-                    if (tx) {
-                        tx.type = emType; tx.amount = amount; tx.desc = text;
-                        const queuedCreate = pendingOps.find(o => o.kind === 'create' && o.id === tx.id);
-                        if (queuedCreate) {
-                            // هنوز ارسال نشده؛ همان مورد در صف را اصلاح می‌کنیم
-                            queuedCreate.payload.tx_type = emType;
-                            queuedCreate.payload.amount = amount;
-                            queuedCreate.payload.tx_desc = text;
-                            saveQueue(); flushQueue();
-                        } else {
-                            enqueue({ kind: 'update', id: tx.id, payload: { action: 'save_finance_transaction', edit_id: tx.id, person: tx.person, tx_type: emType, amount: amount, tx_desc: text, tx_date: tx.date } });
-                        }
-                        saveCache();
-                        renderMonthSelect();
-                        updateUI();
-                    }
+                const tx = transactions.find(x => x.id === emTarget.id);
+                if (tx) {
+                    tx.type = emType; tx.amount = amount; tx.desc = text;
+                    queueUpsert(tx);
                 }
                 window.closeEditModal();
-                emSave.disabled = false; emSave.textContent = '💾 ذخیره';
+                toast('✓ ذخیره شد');
+                updateUI();
             });
             [emAmount, emDesc].forEach(el => el.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); emSave.click(); } }));
 
-            window.cancelEdit = function() {
-                document.getElementById('transaction-form').reset();
-                document.getElementById('edit_id').value = '0';
-                document.getElementById('tx_date').value = '';
-                document.getElementById('amount').value = '';
-                document.querySelectorAll('#transaction-form .toggle-btn').forEach(b => b.classList.toggle('active', b.getAttribute('data-value') === 'expense'));
-                document.getElementById('type').value = 'expense';
-
-                resetTagPick();
-                document.getElementById('form-title').textContent = formTitleText();
-                const submitBtn = document.getElementById('submit-btn');
-                submitBtn.textContent = 'ثبت تراکنش';
-                submitBtn.style.background = '';
-                submitBtn.style.color = '';
-
-                document.getElementById('cancel-edit-btn').style.display = 'none';
-            };
-
             window.deleteTx = function(id) {
                 itemToDelete = { kind: 'tx', id: id };
-                document.getElementById('delete-modal').classList.add('active');
+                $('delete-modal').classList.add('active');
             };
 
             window.closeModal = function() {
                 itemToDelete = null;
-                document.getElementById('delete-modal').classList.remove('active');
+                $('delete-modal').classList.remove('active');
             };
 
-            document.getElementById('confirm-delete-btn').addEventListener('click', function() {
-                if(!itemToDelete) return;
-                const item = itemToDelete;
-                const btn = this;
-
-                if (item.kind === 'tx') {
-                    transactions = transactions.filter(t => t.id !== item.id);
-                    selectedIds.delete(item.id);
-                    setGroup([item.id], '');
-
-                    const qi = pendingOps.findIndex(o => o.kind === 'create' && o.id === item.id);
-                    if (qi >= 0) {
-                        // هنوز ارسال نشده بود؛ فقط از صف برش می‌داریم
-                        pendingOps.splice(qi, 1);
-                        pendingOps = pendingOps.filter(o => o.id !== item.id);
-                        saveQueue(); refreshPendingIds();
-                    } else {
-                        pendingOps = pendingOps.filter(o => o.id !== item.id);
-                        saveQueue();
-                        enqueue({ kind: 'delete', id: item.id, payload: { action: 'delete_finance_transaction', id: item.id } });
-                    }
-                    saveCache();
-                    renderMonthSelect();
-                    updateUI();
+            $('confirm-delete-btn').addEventListener('click', function() {
+                if (!itemToDelete) return;
+                const tx = transactions.find(t => t.id === itemToDelete.id);
+                if (tx) {
+                    transactions = transactions.filter(t => t !== tx);
+                    selectedIds.delete(tx.id);
+                    setGroup([tx.id], '');
+                    queueDelete(tx);
                 }
                 window.closeModal();
-                btn.textContent = 'بله، حذف کن';
-                btn.disabled = false;
+                toast('🗑 حذف شد');
+                updateUI();
             });
 
-            /* ---------- موارد آماده (کشویی با جستجو) ---------- */
+            /* ---------- موارد آماده (دکمه‌های دوتایی + زیرمنو) ---------- */
             const DEFAULT_TAGS = ['🚕 اسنپ', '☕ کافه', '🛒 سوپر', '⛽ بنزین', '🍽 غذا', '💳 اقساط', '💰 حقوق', '🎧 پشتیبانی', '👤 اکانت', '💆 لیزر', '💬 مشاوره', '🎬 سینما', '🎭 تئاتر', '💧 آب'];
             const DEFAULT_INST_TAGS = ['🛍 اقساط دیجی پی', '🏦 اقساط تارا', '🚕 اقساط اسنپ', '🪙 اقساط اوانو', '🔍 اقساط ترب پی', '💙 اقساط بلو', '🛡 اقساط ازکی', '👨 اقساط قرعه کشی حسین', '👩 اقساط قرعه کشی سارینا'];
             const DEFAULT_INCOME_TAGS = ['💰 حقوق', '🎧 پشتیبانی', '👤 اکانت'];
@@ -1797,7 +2097,8 @@ function finance_tracker_shortcode_render() {
                 inst: { custom: 'finance_inst_custom_tags', hidden: 'finance_inst_hidden_tags', base: DEFAULT_INST_TAGS }
             };
             const INCOME_KEY = 'finance_income_tags';
-            let instTagsOpen = false;
+            let tagView = 'root';             // root | inst  (داخل زیرمنوی اقساط)
+            let pickedTag = '';
             let tagDelMode = false;
             let tagModalScope = 'main';
             const ICON_CHOICES = ['⭐','🏷','🛒','🍽','☕','🍔','🍕','🥤','🚕','🚗','🚌','⛽','🛵','🏠','💡','💧','🔥','📱','💻','🌐','📶','🎬','🎭','🎮','🎧','🎁','👕','👟','💄','💆','💊','🏥','💉','🦷','📚','📝','🏫','🏦','💳','💰','💵','📈','🧾','🛡','🪙','🐱','🌳','🌴','🛫','⚽','🏃','👤','👨','👩','👶','🎂','💍','🔧','🧹','🔍','💙'];
@@ -1849,6 +2150,7 @@ function finance_tracker_shortcode_render() {
                 }
                 const inc = readTagList(INCOME_KEY).filter(x => x !== tagText);
                 writeTagList(INCOME_KEY, inc);
+                if (pickedTag === tagText) pickedTag = '';
                 renderTags();
             }
 
@@ -1857,107 +2159,105 @@ function finance_tracker_shortcode_render() {
                 if (btn) btn.click();
             }
 
-            function closeTagDd() { closeAllDd(); }
+            function syncDescWrap() {
+                $('desc-wrap').classList.toggle('has-val', descInput.value !== '');
+            }
 
             function resetTagPick() {
-                document.getElementById('tag-dd-current').textContent = 'انتخاب مورد آماده';
-                closeTagDd();
+                pickedTag = '';
+                tagView = 'root';
+                syncDescWrap();
+                renderTags();
             }
 
             function pickTag(tagText) {
-                const clean = tagText.replace('📌 ', '');
-                document.getElementById('desc').value = clean;
-                document.getElementById('tag-dd-current').textContent = clean;
+                descInput.value = tagText.replace('📌 ', '');
+                pickedTag = tagText;
+                syncDescWrap();
                 setTxType(isIncomeTag(tagText) ? 'income' : 'expense');
-                closeTagDd();
+                renderTags();
             }
 
-            function tagItemEl(tagText, scope, opts) {
-                opts = opts || {};
-                const el = document.createElement('div');
-                el.className = 'cat-item' + (opts.child ? ' tag-child' : '') + (opts.group ? ' tag-group' : '') + (opts.group && instTagsOpen ? ' open' : '');
-                if (tagDelMode) {
-                    const x = document.createElement('span');
-                    x.className = 'item-x';
-                    x.textContent = '✕ ';
-                    el.appendChild(x);
-                }
-                const label = document.createElement('span');
-                label.textContent = tagText.replace('📌 ', '');
-                el.appendChild(label);
-                if (opts.group) {
-                    const c = document.createElement('span');
-                    c.className = 'grp-caret';
-                    c.textContent = '▾';
-                    el.appendChild(c);
-                }
-                el.addEventListener('click', () => {
-                    if (tagDelMode) { removeTag(scope, tagText); return; }
-                    if (opts.group) { instTagsOpen = !instTagsOpen; renderTagItems(document.getElementById('tag-search').value); return; }
+            function tileEl(tagText, scope, isGroup) {
+                const parts = splitIcon(tagText);
+                // داخل زیرمنوی اقساط، کلمهٔ تکراری «اقساط» حذف می‌شود تا اسم کامل جا شود
+                if (tagView === 'inst' && scope === 'inst') parts.label = parts.label.replace(/^اقساط\s+/, '') || parts.label;
+                const removable = tagDelMode && !isGroup;
+                const b = document.createElement('button');
+                b.type = 'button';
+                b.className = 'qt' + (isGroup ? ' group' : '') + (tagText === pickedTag ? ' sel' : '') + (removable ? ' removable' : '');
+                b.title = parts.label;
+                b.innerHTML = '<span class="qt-icon">' + esc(parts.icon || '🏷') + '</span>' +
+                    '<span class="qt-label">' + esc(parts.label) + '</span>' +
+                    (isGroup ? '<span class="qt-go">‹</span>' : '') +
+                    (removable ? '<span class="qt-x">✕</span>' : '');
+                b.addEventListener('click', () => {
+                    if (isGroup) { tagView = 'inst'; renderTags(); return; }
+                    if (removable) { removeTag(scope, tagText); return; }
                     pickTag(tagText);
                 });
-                return el;
+                return b;
             }
 
-            function renderTagItems(filter) {
-                const box = document.getElementById('tag-items');
+            function renderTagItems() {
+                const box = $('tag-items');
                 if (!box) return;
-                const f = normText(filter || '');
+                // اگر کاربر خودش می‌نویسد، موارد آماده با همان متن فیلتر می‌شوند
+                const f = pickedTag ? '' : normText(descInput.value);
+                const hit = t => normText(t).indexOf(f) >= 0;
                 const inst = tagsOf('inst');
-                const hit = t => !f || normText(t).indexOf(f) >= 0;
+                const inSub = tagView === 'inst';
+
+                $('tag-head').style.display = inSub ? 'flex' : 'none';
+                if (inSub) $('tag-head-title').textContent = INST_TAG;
+
+                let list;
+                if (inSub) list = inst.filter(t => !f || hit(t)).map(t => [t, 'inst', false]);
+                else if (f) list = mainTags().filter(hit).map(t => [t, 'main', t === INST_TAG]).concat(inst.filter(hit).map(t => [t, 'inst', false]));
+                else list = mainTags().map(t => [t, 'main', t === INST_TAG]);
+
                 box.innerHTML = '';
-                let any = false;
-
-                mainTags().forEach(t => {
-                    const isGroup = (t === INST_TAG);
-                    if (f) {
-                        if (hit(t)) { any = true; box.appendChild(tagItemEl(t, 'main', {})); }
-                        return;
-                    }
-                    any = true;
-                    box.appendChild(tagItemEl(t, 'main', { group: isGroup }));
-                    if (isGroup && instTagsOpen) {
-                        inst.forEach(x => box.appendChild(tagItemEl(x, 'inst', { child: true })));
-                        const add = document.createElement('div');
-                        add.className = 'cat-item tag-child';
-                        add.textContent = '➕ افزودن قسط جدید';
-                        add.addEventListener('click', () => openTagModal('inst'));
-                        box.appendChild(add);
-                    }
-                });
-
-                if (f) {
-                    inst.forEach(t => { if (hit(t)) { any = true; box.appendChild(tagItemEl(t, 'inst', { child: true })); } });
+                if (!list.length) {
+                    box.innerHTML = '<div class="tag-empty">' + (f ? '✍️ همین متنی که نوشتید ثبت می‌شود' : 'موردی وجود ندارد؛ با «➕» اضافه کنید') + '</div>';
+                    return;
                 }
-                if (!any) box.innerHTML = '<div class="cat-empty">موردی پیدا نشد</div>';
+                const frag = document.createDocumentFragment();
+                list.forEach(a => frag.appendChild(tileEl(a[0], a[1], a[2])));
+                box.appendChild(frag);
             }
 
             function renderTags() {
-                renderTagItems(document.getElementById('tag-search') ? document.getElementById('tag-search').value : '');
-                const del = document.getElementById('tag-del-btn');
+                renderTagItems();
+                const del = $('tag-del-btn');
                 if (del) {
                     del.classList.toggle('on', tagDelMode);
                     del.textContent = tagDelMode ? '✅ پایان حذف' : '🗑 حذف';
                 }
+                const add = $('tag-add-btn');
+                if (add) add.textContent = tagView === 'inst' ? '➕ قسط جدید' : '➕ مورد جدید';
             }
 
-            document.getElementById('tag-dd-btn').addEventListener('click', function(e) {
-                e.stopPropagation();
-                const dd = document.getElementById('tag-dd');
-                if (dd.classList.contains('open')) { closeAllDd(); return; }
-                openDd(dd);
-                const se = document.getElementById('tag-search');
-                se.value = '';
-                renderTags();
-                if (!isMobile()) se.focus();
+            descInput.addEventListener('input', function() {
+                if (pickedTag && descInput.value !== pickedTag.replace('📌 ', '')) pickedTag = '';
+                syncDescWrap();
+                renderTagItems();
             });
-            document.getElementById('tag-search').addEventListener('input', function() { renderTagItems(this.value); });
-            document.getElementById('tag-search').addEventListener('keydown', function(e) { if (e.key === 'Enter') e.preventDefault(); });
-            document.getElementById('tag-del-btn').addEventListener('click', function() {
+            $('desc-clear').addEventListener('click', function() {
+                descInput.value = '';
+                pickedTag = '';
+                syncDescWrap();
+                renderTags();
+                descInput.focus();
+            });
+            $('tag-back-btn').addEventListener('click', function() {
+                tagView = 'root';
+                renderTags();
+            });
+            $('tag-del-btn').addEventListener('click', function() {
                 tagDelMode = !tagDelMode;
                 renderTags();
             });
-            document.getElementById('tag-add-btn').addEventListener('click', function() { openTagModal('main'); });
+            $('tag-add-btn').addEventListener('click', function() { openTagModal(tagView === 'inst' ? 'inst' : 'main'); });
 
             /* مودال افزودن */
             function setNewTagKind(kind) {
@@ -1969,8 +2269,8 @@ function finance_tracker_shortcode_render() {
             });
 
             function renderIconGrid() {
-                const grid = document.getElementById('icon-grid');
-                const prev = document.getElementById('icon-preview');
+                const grid = $('icon-grid');
+                const prev = $('icon-preview');
                 if (!grid) return;
                 if (prev) prev.textContent = selectedIcon;
                 grid.innerHTML = '';
@@ -1985,45 +2285,42 @@ function finance_tracker_shortcode_render() {
 
             function openTagModal(scope) {
                 tagModalScope = scope;
-                document.getElementById('add-tag-title').textContent = scope === 'inst' ? 'افزودن قسط جدید' : 'افزودن مورد آماده';
+                $('add-tag-title').textContent = scope === 'inst' ? 'افزودن قسط جدید' : 'افزودن مورد آماده';
                 selectedIcon = scope === 'inst' ? '💳' : '⭐';
                 setNewTagKind('expense');
                 renderIconGrid();
-                document.getElementById('new-tag-input').value = '';
-                document.getElementById('add-tag-modal').classList.add('active');
-                document.getElementById('new-tag-input').focus();
+                $('new-tag-input').value = '';
+                $('add-tag-modal').classList.add('active');
+                $('new-tag-input').focus();
             }
 
             window.closeTagModal = function() {
-                document.getElementById('add-tag-modal').classList.remove('active');
+                $('add-tag-modal').classList.remove('active');
             };
 
-            const saveTagBtn = document.getElementById('save-new-tag-btn');
-            if(saveTagBtn) {
-                saveTagBtn.addEventListener('click', function() {
-                    let inputVal = document.getElementById('new-tag-input').value.trim();
-                    if(inputVal) {
-                        if (tagModalScope === 'inst' && inputVal.indexOf('قسط') < 0) inputVal = 'اقساط ' + inputVal;
-                        const tag = selectedIcon + ' ' + inputVal;
-                        const key = TAG_KEYS[tagModalScope].custom;
-                        const customTags = readTagList(key);
-                        customTags.push(tag);
-                        writeTagList(key, customTags);
-                        if (newTagKind === 'income') {
-                            const inc = readTagList(INCOME_KEY);
-                            inc.push(tag);
-                            writeTagList(INCOME_KEY, inc);
-                        }
-                        if (tagModalScope === 'inst') instTagsOpen = true;
-                        renderTags();
-                        window.closeTagModal();
-                    }
-                });
-            }
-            renderTags();
+            $('save-new-tag-btn').addEventListener('click', function() {
+                let inputVal = $('new-tag-input').value.trim();
+                if (!inputVal) return;
+                if (tagModalScope === 'inst' && inputVal.indexOf('قسط') < 0) inputVal = 'اقساط ' + inputVal;
+                const tag = selectedIcon + ' ' + inputVal;
+                const key = TAG_KEYS[tagModalScope].custom;
+                const customTags = readTagList(key);
+                customTags.push(tag);
+                writeTagList(key, customTags);
+                if (newTagKind === 'income') {
+                    const inc = readTagList(INCOME_KEY);
+                    inc.push(tag);
+                    writeTagList(INCOME_KEY, inc);
+                }
+                tagView = tagModalScope === 'inst' ? 'inst' : 'root';
+                renderTags();
+                window.closeTagModal();
+            });
+            $('new-tag-input').addEventListener('keydown', function(e) {
+                if (e.key === 'Enter') { e.preventDefault(); $('save-new-tag-btn').click(); }
+            });
 
             /* ---------- فرم تراکنش ---------- */
-            const typeInput = document.getElementById('type');
             const toggleBtns = document.querySelectorAll('#transaction-form .toggle-btn');
             toggleBtns.forEach(btn => {
                 btn.addEventListener('click', () => {
@@ -2033,15 +2330,14 @@ function finance_tracker_shortcode_render() {
                 });
             });
 
-            const amountInput = document.getElementById('amount');
-            const descInput = document.getElementById('desc');
-            function bindAmountFormat(el) {
-                el.addEventListener('input', function(e) {
-                    const parsed = parsePersianInt(e.target.value);
-                    e.target.value = parsed > 0 ? fmt(parsed) : '';
-                });
+            function resetForm() {
+                amountInput.value = '';
+                descInput.value = '';
+                toggleBtns.forEach(b => b.classList.toggle('active', b.getAttribute('data-value') === 'expense'));
+                typeInput.value = 'expense';
+                $('form-title').textContent = formTitleText();
+                resetTagPick();
             }
-            bindAmountFormat(amountInput);
 
             function transferMirror(person, type, desc) {
                 const other = otherPerson(person);
@@ -2053,71 +2349,101 @@ function finance_tracker_shortcode_render() {
                 };
             }
 
-            function saveMirror(mir, amount) {
-                addTransactionLocally(mir.person, mir.type, amount, mir.desc);
-            }
-
-            /* ثبت محلی + گذاشتن در صف ارسال */
+            /* ثبت محلی (فوری) + گذاشتن در صف ارسال پس‌زمینه */
             function addTransactionLocally(person, type, amount, desc) {
                 const id = nextTmpId();
-                transactions.unshift({ id: id, person: person, type: type, amount: amount, desc: desc, date: ymd(new Date()) });
-                enqueue({
-                    kind: 'create', id: id,
-                    payload: { action: 'save_finance_transaction', edit_id: 0, person: person, tx_type: type, amount: amount, tx_desc: desc }
-                });
-                saveCache();
+                const uid = newUid();
+                const date = ymd(new Date());
+                transactions.unshift({ id: id, uid: uid, person: person, type: type, amount: amount, desc: desc, date: date });
+                enqueue({ v: 2, kind: 'create', id: id, uid: uid, date: date, at: Date.now(), p: { person: person, type: type, amount: amount, desc: desc } });
+                scheduleCacheSave();
                 return id;
             }
 
-            const form = document.getElementById('transaction-form');
-            const submitBtn = document.getElementById('submit-btn');
-
-            form.addEventListener('submit', function(e) {
+            $('transaction-form').addEventListener('submit', function(e) {
                 e.preventDefault();
                 if (currentTab === 'report') return;
 
-                const editId = parseInt(document.getElementById('edit_id').value) || 0;
                 const type = typeInput.value;
                 const amount = parsePersianInt(amountInput.value);
-                const desc = descInput.value;
-                const originalDate = document.getElementById('tx_date').value;
+                const desc = descInput.value.trim();
                 const person = currentTab;
 
-                if (amount <= 0) return;
+                if (amount <= 0) { toast('مبلغ را وارد کنید'); amountInput.focus(); return; }
+                if (!desc) { toast('بنویسید بابت چی بود یا یک مورد آماده انتخاب کنید'); descInput.focus(); return; }
 
-                if (editId !== 0) {
-                    const index = transactions.findIndex(t => t.id === editId);
-                    if (index > -1) {
-                        transactions[index].type = type;
-                        transactions[index].amount = amount;
-                        transactions[index].desc = desc;
-                        transactions[index].person = person;
-                    }
-                    const queuedCreate = pendingOps.find(o => o.kind === 'create' && o.id === editId);
-                    if (queuedCreate) {
-                        queuedCreate.payload.person = person;
-                        queuedCreate.payload.tx_type = type;
-                        queuedCreate.payload.amount = amount;
-                        queuedCreate.payload.tx_desc = desc;
-                        saveQueue(); flushQueue();
-                    } else {
-                        enqueue({ kind: 'update', id: editId, payload: { action: 'save_finance_transaction', edit_id: editId, person: person, tx_type: type, amount: amount, tx_desc: desc, tx_date: originalDate } });
-                    }
-                    window.cancelEdit();
-                } else {
-                    addTransactionLocally(person, type, amount, desc);
-                    amountInput.value = '';
-                    descInput.value = '';
-                    resetTagPick();
-                    const mir = transferMirror(person, type, desc);
-                    if (mir) saveMirror(mir, amount);
-                }
+                addTransactionLocally(person, type, amount, desc);
+                const mir = transferMirror(person, type, desc);
+                if (mir) addTransactionLocally(mir.person, mir.type, amount, mir.desc);
 
-                saveCache();
-                renderMonthSelect();
+                amountInput.value = '';
+                descInput.value = '';
+                resetTagPick();
+                if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+                toast('✓ ثبت شد — ' + fmt(amount) + ' تومان');
                 updateUI();
-                submitBtn.textContent = 'ثبت تراکنش';
             });
+
+            /* ---------- کشوها (باز/بسته با انیمیشن، وضعیت حفظ می‌شود) ---------- */
+            const ACC_MS = 260;
+            function makeDetails(key, open, summaryHtml, rowsHtml) {
+                const d = document.createElement('details');
+                d.dataset.key = key;
+                d.open = open;
+                d.innerHTML = '<summary>' + summaryHtml + '</summary><div class="transaction-list">' + rowsHtml + '</div>';
+                return d;
+            }
+            function isOpen(key, def) { return accOpen[key] === undefined ? def : accOpen[key]; }
+
+            function toggleDetails(d) {
+                const panel = d.querySelector('.transaction-list');
+                if (!panel || d.dataset.busy === '1') return;
+                d.dataset.busy = '1';
+                const key = d.dataset.key;
+                if (d.open) {
+                    if (key) accOpen[key] = false;
+                    panel.style.height = panel.scrollHeight + 'px';
+                    requestAnimationFrame(() => { panel.style.height = '0px'; });
+                    setTimeout(() => { d.open = false; panel.style.height = ''; d.dataset.busy = '0'; }, ACC_MS);
+                } else {
+                    if (key) accOpen[key] = true;
+                    d.open = true;
+                    const target = panel.scrollHeight;
+                    panel.style.height = '0px';
+                    requestAnimationFrame(() => { panel.style.height = target + 'px'; });
+                    setTimeout(() => { panel.style.height = ''; d.dataset.busy = '0'; }, ACC_MS);
+                }
+            }
+
+            /* رویدادهای لیست‌ها یک بار و به صورت واگذار ثبت می‌شوند (سریع‌تر از ثبت روی تک‌تک ردیف‌ها) */
+            function onCheck(cb) {
+                const id = parseInt(cb.getAttribute('data-check'), 10);
+                if (cb.checked) selectedIds.add(id); else selectedIds.delete(id);
+                const row = cb.closest('.transaction-item');
+                if (row) row.classList.toggle('picked', cb.checked);
+                updateSumBar();
+            }
+            function bindListEvents(root) {
+                if (!root) return;
+                root.addEventListener('click', function(e) {
+                    const summary = e.target.closest('summary');
+                    if (summary && root.contains(summary)) { e.preventDefault(); toggleDetails(summary.parentElement); return; }
+                    const row = e.target.closest('.transaction-item');
+                    if (!row || !root.contains(row)) return;
+                    if (selectMode) {
+                        if (e.target.matches('[data-check]')) return;
+                        const cb = row.querySelector('[data-check]');
+                        if (cb) { cb.checked = !cb.checked; onCheck(cb); }
+                        return;
+                    }
+                    openTxMenu(parseInt(row.getAttribute('data-tx'), 10));
+                });
+                root.addEventListener('change', function(e) {
+                    if (e.target.matches('[data-check]')) onCheck(e.target);
+                });
+            }
+            bindListEvents($('accordion-list'));
+            bindListEvents($('inst-cat-list'));
 
             /* ---------- اقساط (از روی تراکنش‌های دسته اقساط) ---------- */
             const INST_WORDS = ['اقساط', 'قسط'];
@@ -2127,8 +2453,8 @@ function finance_tracker_shortcode_render() {
             }
 
             function renderInstSection() {
-                const box = document.getElementById('inst-cat-list');
-                const sum = document.getElementById('inst-summary');
+                const box = $('inst-cat-list');
+                const sum = $('inst-summary');
                 if (!box || !sum) return;
 
                 const list = visibleTx().filter(isInstTx);
@@ -2149,24 +2475,16 @@ function finance_tracker_shortcode_render() {
                 });
                 sum.innerHTML = `جمع کل اقساط: <b class="text-red">${fmt(grand)}</b> تومان | ${plain.format(list.length)} پرداخت در ${plain.format(Object.keys(groups).length)} عنوان`;
 
-                const isReport = currentTab === 'report';
                 const keys = Object.keys(groups).sort((a, b) => groups[b].total - groups[a].total);
-                box.innerHTML = keys.map(k => {
+                box.innerHTML = '';
+                keys.forEach(k => {
                     const g = groups[k];
                     g.items.sort((a, b) => b.date.localeCompare(a.date) || b.id - a.id);
-                    return `
-                    <details>
-                        <summary>
-                            <span>${esc(g.name)}<span class="cat-sub">${plain.format(g.items.length)} بار</span></span>
-                            <div class="day-summary-text">جمع: <b>${fmt(g.total)}</b></div>
-                        </summary>
-                        <div class="transaction-list">
-                            ${g.items.map(item => txRowHtml(item, { showDesc: false })).join('')}
-                        </div>
-                    </details>`;
-                }).join('');
-                bindAccordion(box);
-                bindChecks(box);
+                    box.appendChild(makeDetails('i:' + k, isOpen('i:' + k, false),
+                        '<span>' + esc(g.name) + '<span class="cat-sub">' + plain.format(g.items.length) + ' بار</span></span>' +
+                        '<div class="day-summary-text">جمع: <b>' + fmt(g.total) + '</b></div>',
+                        g.items.map(item => txRowHtml(item, { showDesc: false })).join('')));
+                });
             }
 
             /* ---------- دسته‌بندی ---------- */
@@ -2184,8 +2502,10 @@ function finance_tracker_shortcode_render() {
                 });
             });
 
+            const EMPTY_HTML = '<div style="text-align:center; opacity:0.6; padding:10px;">تراکنشی یافت نشد</div>';
+
             function renderCategories(list) {
-                const container = document.getElementById('accordion-list');
+                const container = $('accordion-list');
                 if (!container) return;
                 container.innerHTML = '';
                 const groups = {};
@@ -2196,30 +2516,20 @@ function finance_tracker_shortcode_render() {
                     if (t.type === 'income') g.income += t.amount; else g.expense += t.amount;
                 });
                 const keys = Object.keys(groups).sort((a, b) => (groups[b].income + groups[b].expense) - (groups[a].income + groups[a].expense));
-                if (keys.length === 0) {
-                    container.innerHTML = '<div style="text-align:center; opacity:0.6; padding:10px;">تراکنشی یافت نشد</div>';
-                    return;
-                }
-                const isReport = currentTab === 'report';
+                if (keys.length === 0) { container.innerHTML = EMPTY_HTML; return; }
+                const frag = document.createDocumentFragment();
                 keys.forEach(k => {
                     const g = groups[k];
                     g.items.sort((a, b) => b.date.localeCompare(a.date) || b.id - a.id);
                     const parts = [];
                     if (g.income > 0) parts.push('<span class="text-green">▲ ' + fmt(g.income) + '</span>');
                     if (g.expense > 0) parts.push('<span class="text-red">▼ ' + fmt(g.expense) + '</span>');
-                    const details = document.createElement('details');
-                    details.innerHTML = `
-                        <summary>
-                            <span>${esc(g.name)}<span class="cat-sub">${plain.format(g.items.length)} بار</span></span>
-                            <div class="day-summary-text">${parts.join(' | ')}</div>
-                        </summary>
-                        <div class="transaction-list">
-                            ${g.items.map(item => txRowHtml(item, { showDesc: false })).join('')}
-                        </div>`;
-                    container.appendChild(details);
+                    frag.appendChild(makeDetails('c:' + k, isOpen('c:' + k, false),
+                        '<span>' + esc(g.name) + '<span class="cat-sub">' + plain.format(g.items.length) + ' بار</span></span>' +
+                        '<div class="day-summary-text">' + parts.join('') + '</div>',
+                        g.items.map(item => txRowHtml(item, { showDesc: false })).join('')));
                 });
-                bindAccordion(container);
-                bindChecks(container);
+                container.appendChild(frag);
             }
 
             /* ---------- آمار و تاریخچه ---------- */
@@ -2228,25 +2538,29 @@ function finance_tracker_shortcode_render() {
                 list.forEach(t => {
                     const inc = t.type === 'income';
                     if (inc) s.ti += t.amount; else s.te += t.amount;
-                    if (monthKey(t.date) === info.monthKey) { if (inc) s.mi += t.amount; else s.me += t.amount; }
-                    if (jalaliOf(t.date)[0] === info.year) { if (inc) s.yi += t.amount; else s.ye += t.amount; }
+                    const j = jalaliOf(t.date);
+                    if (j[0] === info.year) {
+                        if (inc) s.yi += t.amount; else s.ye += t.amount;
+                        if (j[0] + '-' + j[1] === info.monthKey) { if (inc) s.mi += t.amount; else s.me += t.amount; }
+                    }
                 });
                 return s;
             }
 
-            function updateUI() {
+            function renderHistorySection() {
+                renderMonthSelect();
                 const info = nowInfo();
                 const list = visibleTx();
                 const s = calcStats(list, info);
 
-                document.getElementById('total-balance').textContent = fmt(s.ti - s.te);
-                document.getElementById('year-income').textContent = '+' + fmt(s.yi);
-                document.getElementById('year-expense').textContent = '-' + fmt(s.ye);
-                document.getElementById('month-income').textContent = '+' + fmt(s.mi);
-                document.getElementById('month-expense').textContent = '-' + fmt(s.me);
+                $('total-balance').textContent = fmt(s.ti - s.te);
+                $('year-income').textContent = '+' + fmt(s.yi);
+                $('year-expense').textContent = '-' + fmt(s.ye);
+                $('month-income').textContent = '+' + fmt(s.mi);
+                $('month-expense').textContent = '-' + fmt(s.me);
 
                 // تفکیک افراد در تب گزارش کل
-                const pb = document.getElementById('person-breakdown');
+                const pb = $('person-breakdown');
                 if (currentTab === 'report') {
                     pb.innerHTML = Object.keys(PEOPLE).map(p => {
                         const ps = calcStats(transactions.filter(t => t.person === p), info);
@@ -2258,18 +2572,9 @@ function finance_tracker_shortcode_render() {
                     }).join('');
                 }
 
-                const groupedByDate = {};
                 let filteredTx = list;
                 if (currentFilter !== 'all') filteredTx = filteredTx.filter(t => t.type === currentFilter);
                 if (currentMonthFilter !== '') filteredTx = filteredTx.filter(t => monthKey(t.date) === currentMonthFilter);
-
-                filteredTx.forEach(t => {
-                    if (!groupedByDate[t.date]) groupedByDate[t.date] = { income: 0, expense: 0, items: [] };
-                    groupedByDate[t.date].items.push(t);
-                    if (t.type === 'income') groupedByDate[t.date].income += t.amount;
-                    else groupedByDate[t.date].expense += t.amount;
-                });
-
                 if (groupFilter) filteredTx = filteredTx.filter(t => groupOf(t.id) === groupFilter);
                 lastFilteredTx = filteredTx;
 
@@ -2284,133 +2589,61 @@ function finance_tracker_shortcode_render() {
                     });
                     renderHistory(gd);
                 }
-                renderInstSection();
                 updateSumBar();
                 renderEvFilter();
-                renderNetBar();
             }
 
-            const ACC_MS = 260;
-            function bindAccordion(root) {
-                if (!root) return;
-                root.querySelectorAll('details').forEach(d => {
-                    if (d.dataset.acc === '1') return;
-                    d.dataset.acc = '1';
-                    const summary = d.querySelector('summary');
-                    const panel = d.querySelector('.transaction-list');
-                    if (!summary || !panel) return;
-                    summary.addEventListener('click', e => {
-                        e.preventDefault();
-                        if (d.dataset.busy === '1') return;
-                        d.dataset.busy = '1';
-                        if (d.open) {
-                            panel.style.height = panel.scrollHeight + 'px';
-                            requestAnimationFrame(() => { panel.style.height = '0px'; });
-                            setTimeout(() => {
-                                d.open = false;
-                                panel.style.height = '';
-                                d.dataset.busy = '0';
-                            }, ACC_MS);
-                        } else {
-                            d.open = true;
-                            const target = panel.scrollHeight;
-                            panel.style.height = '0px';
-                            requestAnimationFrame(() => { panel.style.height = target + 'px'; });
-                            setTimeout(() => {
-                                panel.style.height = '';
-                                d.dataset.busy = '0';
-                            }, ACC_MS);
-                        }
-                    });
-                });
+            /* فقط بخشی که روی صفحه است ساخته می‌شود؛ ثبت در صفحهٔ «ثبت تراکنش» فوری است */
+            function renderNow() {
+                if (currentSection === 'history') renderHistorySection();
+                else if (currentSection === 'inst') renderInstSection();
+                renderNetBar();
+            }
+            let renderQueued = false;
+            function updateUI() {
+                if (renderQueued) return;
+                renderQueued = true;
+                requestAnimationFrame(() => { renderQueued = false; renderNow(); });
             }
 
             function renderHistory(groupedData) {
-                const container = document.getElementById('accordion-list');
+                const container = $('accordion-list');
                 if(!container) return;
 
                 container.innerHTML = '';
                 const sortedDates = Object.keys(groupedData).sort((a, b) => b.localeCompare(a));
+                if (sortedDates.length === 0) { container.innerHTML = EMPTY_HTML; return; }
 
-                if(sortedDates.length === 0) {
-                    container.innerHTML = '<div style="text-align:center; opacity:0.6; padding:10px;">تراکنشی یافت نشد</div>';
-                    return;
-                }
-
-                const isReport = currentTab === 'report';
-
+                const frag = document.createDocumentFragment();
                 sortedDates.forEach((date, idx) => {
                     const dayData = groupedData[date];
-                    const displayDate = dateLabel(date);
-
                     let summaryText = '';
-                    if(currentFilter === 'all') {
-                        summaryText = `<span class="text-green">▲ ${fmt(dayData.income)}</span> | <span class="text-red">▼ ${fmt(dayData.expense)}</span>`;
-                    } else if (currentFilter === 'income') {
-                        summaryText = `<span class="text-green">▲ ${fmt(dayData.income)}</span>`;
-                    } else {
-                        summaryText = `<span class="text-red">▼ ${fmt(dayData.expense)}</span>`;
-                    }
-
-                    const details = document.createElement('details');
-                    details.open = (idx === 0);
-                    details.innerHTML = `
-                        <summary>
-                            <span>${displayDate}</span>
-                            <div class="day-summary-text">${summaryText}</div>
-                        </summary>
-                        <div class="transaction-list">
-                            ${dayData.items.map(item => txRowHtml(item)).join('')}
-                        </div>
-                    `;
-                    container.appendChild(details);
+                    if (currentFilter !== 'expense' && (dayData.income > 0 || currentFilter === 'income')) summaryText += `<span class="text-green">▲ ${fmt(dayData.income)}</span>`;
+                    if (currentFilter !== 'income' && (dayData.expense > 0 || currentFilter === 'expense')) summaryText += `<span class="text-red">▼ ${fmt(dayData.expense)}</span>`;
+                    frag.appendChild(makeDetails('d:' + date, isOpen('d:' + date, idx === 0),
+                        '<span>' + dayTitle(date) + '<span class="cat-sub">' + plain.format(dayData.items.length) + ' مورد</span></span>' +
+                        '<div class="day-summary-text">' + summaryText + '</div>',
+                        dayData.items.map(item => txRowHtml(item)).join('')));
                 });
-                bindAccordion(container);
-                bindChecks(container);
+                container.appendChild(frag);
             }
 
             /* ================= انتخاب چندتایی و جمع ================= */
-            const sumBar = document.getElementById('sum-bar');
-
-            function bindChecks(root) {
-                if (!root) return;
-                root.querySelectorAll('[data-check]').forEach(cb => {
-                    cb.addEventListener('click', e => e.stopPropagation());
-                    cb.addEventListener('change', function() {
-                        const id = parseInt(this.getAttribute('data-check'), 10);
-                        if (this.checked) selectedIds.add(id); else selectedIds.delete(id);
-                        const row = this.closest('.transaction-item');
-                        if (row) row.classList.toggle('picked', this.checked);
-                        updateSumBar();
-                    });
-                });
-                // در حالت انتخاب، کلیک روی خود ردیف هم تیک می‌زند
-                root.querySelectorAll('.transaction-item').forEach(row => {
-                    row.addEventListener('click', function(e) {
-                        if (!selectMode) return;
-                        if (e.target.closest('.tx-actions') || e.target.matches('[data-check]')) return;
-                        const cb = this.querySelector('[data-check]');
-                        if (!cb) return;
-                        cb.checked = !cb.checked;
-                        cb.dispatchEvent(new Event('change'));
-                    });
-                });
-            }
+            const sumBar = $('sum-bar');
 
             function selectedTx() {
                 return transactions.filter(t => selectedIds.has(t.id));
             }
 
             function updateSumBar() {
-                if (!sumBar) return;
+                if (!sumBar || !selectMode) return;
                 const list = selectedTx();
                 let inc = 0, exp = 0;
                 list.forEach(t => { if (t.type === 'income') inc += t.amount; else exp += t.amount; });
                 const net = inc - exp;
-                document.getElementById('sum-count').textContent = plain.format(list.length) + ' مورد انتخاب شده';
-                const netEl = document.getElementById('sum-net');
-                netEl.innerHTML = '<b class="' + (net >= 0 ? 'text-green' : 'text-red') + '">' + (net < 0 ? '-' : '') + fmt(Math.abs(net)) + '</b> تومان';
-                document.getElementById('sum-detail').innerHTML =
+                $('sum-count').textContent = plain.format(list.length) + ' مورد انتخاب شده';
+                $('sum-net').innerHTML = '<b class="' + (net >= 0 ? 'text-green' : 'text-red') + '">' + (net < 0 ? '-' : '') + fmt(Math.abs(net)) + '</b> تومان';
+                $('sum-detail').innerHTML =
                     '<span class="text-green">▲ درآمد: ' + fmt(inc) + '</span>' +
                     '<span class="text-red">▼ هزینه: ' + fmt(exp) + '</span>';
             }
@@ -2419,31 +2652,31 @@ function finance_tracker_shortcode_render() {
                 selectMode = on;
                 appRoot.classList.toggle('select-mode', on);
                 if (!on) selectedIds.clear();
-                document.getElementById('select-mode-btn').textContent = on ? '✖️ پایان انتخاب' : '☑️ انتخاب چندتایی';
+                $('select-mode-btn').textContent = on ? '✖️ پایان انتخاب' : '☑️ انتخاب چند مورد (جمع‌زدن / رویداد)';
                 updateUI();
             }
 
-            document.getElementById('select-mode-btn').addEventListener('click', () => setSelectMode(!selectMode));
+            $('select-mode-btn').addEventListener('click', () => setSelectMode(!selectMode));
 
-            document.getElementById('sum-clear-btn').addEventListener('click', () => {
+            $('sum-clear-btn').addEventListener('click', () => {
                 selectedIds.clear();
                 updateUI();
             });
 
-            document.getElementById('sum-all-btn').addEventListener('click', function() {
+            $('sum-all-btn').addEventListener('click', function() {
                 const all = lastFilteredTx.every(t => selectedIds.has(t.id)) && lastFilteredTx.length > 0;
                 if (all) selectedIds.clear();
                 else lastFilteredTx.forEach(t => selectedIds.add(t.id));
                 updateUI();
             });
 
-            /* ================= گروه دوم ================= */
-            const groupModal = document.getElementById('group-modal');
+            /* ================= گروه دوم (رویداد) ================= */
+            const groupModal = $('group-modal');
             let pendingGroupIds = [];
             let pickedGroupName = '';
 
             function renderGroupChips() {
-                const box = document.getElementById('group-chips');
+                const box = $('group-chips');
                 box.innerHTML = '';
                 const names = allGroupNames();
                 if (names.length === 0) {
@@ -2456,7 +2689,7 @@ function finance_tracker_shortcode_render() {
                     c.textContent = '🧳 ' + n;
                     c.addEventListener('click', () => {
                         pickedGroupName = n;
-                        document.getElementById('group-input').value = n;
+                        $('group-input').value = n;
                         renderGroupChips();
                     });
                     box.appendChild(c);
@@ -2464,11 +2697,11 @@ function finance_tracker_shortcode_render() {
             }
 
             function openGroupModal(ids) {
-                if (!ids.length) { alert('اول چند مورد را تیک بزنید'); return; }
+                if (!ids.length) { toast('اول چند مورد را تیک بزنید'); return; }
                 pendingGroupIds = ids;
                 pickedGroupName = groupOf(ids[0]) || '';
-                document.getElementById('group-input').value = pickedGroupName;
-                document.getElementById('group-modal-sub').textContent =
+                $('group-input').value = pickedGroupName;
+                $('group-modal-sub').textContent =
                     plain.format(ids.length) + ' مورد انتخاب شده‌اند. گروه دوم (مثل یک سفر یا پروژه) را انتخاب یا اضافه کنید.';
                 renderGroupChips();
                 groupModal.classList.add('active');
@@ -2479,21 +2712,20 @@ function finance_tracker_shortcode_render() {
                 groupModal.classList.remove('active');
             };
 
-            document.getElementById('sum-group-btn').addEventListener('click', () => openGroupModal(Array.from(selectedIds)));
+            $('sum-group-btn').addEventListener('click', () => openGroupModal(Array.from(selectedIds)));
 
-            // دکمهٔ 🧳 روی هر ردیف: بدون نیاز به حالت انتخاب
             window.setEvent = function(id) { openGroupModal([id]); };
 
             /* چیپ‌های فیلتر رویداد + راهنمای هر نما */
             const VIEW_HINTS = {
-                date: 'هر روز یک کشو؛ جمع درآمد و خرج همان روز بالای کشو نوشته شده.',
+                date: 'هر روز یک کشو؛ روی هر ردیف بزنید تا ویرایش، رویداد یا حذف را ببینید.',
                 cat: 'موارد هم‌عنوان کنار هم جمع می‌شوند (مثلاً همهٔ «سوپر»ها).',
-                group: 'خرج‌هایی که برای یک ماجرا بوده‌اند کنار هم؛ با دکمهٔ 🧳 روی هر ردیف یا با انتخاب چند مورد، آن‌ها را داخل یک رویداد بگذار.'
+                group: 'خرج‌هایی که برای یک ماجرا بوده‌اند کنار هم؛ از منوی هر ردیف یا با انتخاب چند مورد، آن‌ها را داخل یک رویداد بگذار.'
             };
 
             function renderEvFilter() {
-                const box = document.getElementById('ev-filter');
-                const hint = document.getElementById('view-hint');
+                const box = $('ev-filter');
+                const hint = $('view-hint');
                 if (hint) hint.textContent = VIEW_HINTS[currentView] || '';
                 if (!box) return;
                 const names = allGroupNames();
@@ -2511,26 +2743,27 @@ function finance_tracker_shortcode_render() {
                 names.forEach(n => box.appendChild(mk('🧳 ' + n, n)));
             }
 
-            document.getElementById('group-save-btn').addEventListener('click', function() {
-                const name = document.getElementById('group-input').value.trim();
-                if (!name) { alert('نام گروه را وارد کنید'); return; }
+            $('group-save-btn').addEventListener('click', function() {
+                const name = $('group-input').value.trim();
+                if (!name) { toast('نام رویداد را وارد کنید'); return; }
                 setGroup(pendingGroupIds, name);
                 window.closeGroupModal();
+                toast('🧳 در «' + name + '» گذاشته شد');
                 updateUI();
             });
 
-            document.getElementById('group-remove-btn').addEventListener('click', function() {
+            $('group-remove-btn').addEventListener('click', function() {
                 setGroup(pendingGroupIds, '');
                 window.closeGroupModal();
                 updateUI();
             });
 
-            document.getElementById('group-input').addEventListener('keydown', function(e) {
-                if (e.key === 'Enter') { e.preventDefault(); document.getElementById('group-save-btn').click(); }
+            $('group-input').addEventListener('keydown', function(e) {
+                if (e.key === 'Enter') { e.preventDefault(); $('group-save-btn').click(); }
             });
 
             function renderGroupView(list) {
-                const container = document.getElementById('accordion-list');
+                const container = $('accordion-list');
                 if (!container) return;
                 container.innerHTML = '';
 
@@ -2547,12 +2780,9 @@ function finance_tracker_shortcode_render() {
                     if (b.indexOf('—') === 0) return -1;
                     return (groups[b].income + groups[b].expense) - (groups[a].income + groups[a].expense);
                 });
+                if (keys.length === 0) { container.innerHTML = EMPTY_HTML; return; }
 
-                if (keys.length === 0) {
-                    container.innerHTML = '<div style="text-align:center; opacity:0.6; padding:10px;">تراکنشی یافت نشد</div>';
-                    return;
-                }
-
+                const frag = document.createDocumentFragment();
                 keys.forEach(k => {
                     const g = groups[k];
                     g.items.sort((a, b) => b.date.localeCompare(a.date) || b.id - a.id);
@@ -2561,20 +2791,17 @@ function finance_tracker_shortcode_render() {
                     if (g.income > 0) parts.push('<span class="text-green">▲ ' + fmt(g.income) + '</span>');
                     if (g.expense > 0) parts.push('<span class="text-red">▼ ' + fmt(g.expense) + '</span>');
                     parts.push('<b class="' + (net >= 0 ? 'text-green' : 'text-red') + '">' + (net < 0 ? '-' : '') + fmt(Math.abs(net)) + '</b>');
-                    const details = document.createElement('details');
-                    details.innerHTML =
-                        '<summary><span>' + (k.indexOf('—') === 0 ? esc(k) : '🧳 ' + esc(k)) +
+                    frag.appendChild(makeDetails('g:' + k, isOpen('g:' + k, false),
+                        '<span>' + (k.indexOf('—') === 0 ? esc(k) : '🧳 ' + esc(k)) +
                         '<span class="cat-sub">' + plain.format(g.items.length) + ' مورد</span></span>' +
-                        '<div class="day-summary-text">' + parts.join(' | ') + '</div></summary>' +
-                        '<div class="transaction-list">' + g.items.map(item => txRowHtml(item)).join('') + '</div>';
-                    container.appendChild(details);
+                        '<div class="day-summary-text">' + parts.join('') + '</div>',
+                        g.items.map(item => txRowHtml(item, { showDate: true, showGroup: false })).join('')));
                 });
-                bindAccordion(container);
-                bindChecks(container);
+                container.appendChild(frag);
             }
 
             /* ================= کشویی‌ها: پاپ‌اور موبایل + بستن با کلیک بیرون ================= */
-            const backdrop = document.getElementById('sheet-backdrop');
+            const backdrop = $('sheet-backdrop');
             const isMobile = () => window.matchMedia('(max-width: 640px)').matches;
 
             // روی موبایل پنل را از دل پنل‌های شیشه‌ای بیرون می‌کشیم تا position:fixed درست کار کند
@@ -2638,29 +2865,62 @@ function finance_tracker_shortcode_render() {
                 }
             });
 
-            /* ================= راه‌اندازی حالت آفلاین ================= */
+            /* ================= راه‌اندازی: دادهٔ سرور + کش محلی + صف ================= */
             pendingOps = readQueue();
-            // اگر صفحه آفلاین از کش باز شده و دادهٔ سرور قدیمی‌تر از کش است، از کش استفاده کن
-            (function mergeCache() {
+            (function boot() {
                 const c = readCache();
-                if (c && c.tx.length && transactions.length === 0) transactions = c.tx;
-                const minTmp = transactions.reduce((m, t) => Math.min(m, t.id), 0);
-                tmpCounter = Math.min(-1, minTmp - 1);
-                // مواردی که هنوز ارسال نشده‌اند ولی در لیست نیستند را برگردان
+                if (c) {
+                    const seen = Number(c.seen) || 0;
+                    cacheSeen = Math.max(SERVER_AT, seen);
+                    // صفحه از کش سرویس‌ورکر آمده (قدیمی‌تر از داده‌ای که قبلاً دیده‌ایم) → دادهٔ محلی تازه‌تر است
+                    if ((seen && SERVER_AT <= seen) || (!seen && transactions.length === 0 && c.tx.length)) transactions = c.tx;
+                }
+                transactions.forEach(t => { if (!t.uid) t.uid = ''; });
+
+                const findTarget = op => (op.uid && transactions.find(t => t.uid === op.uid)) || transactions.find(t => t.id === op.id);
                 pendingOps.forEach(op => {
-                    if (op.kind !== 'create') return;
-                    if (transactions.some(t => t.id === op.id)) return;
-                    const p = op.payload;
-                    transactions.unshift({ id: op.id, person: p.person, type: p.tx_type, amount: Number(p.amount), desc: p.tx_desc, date: op.date || ymd(new Date()) });
+                    if (!op.uid && op.id < 0) {
+                        const t = transactions.find(x => x.id === op.id);
+                        if (t && t.uid) op.uid = t.uid;
+                    }
+                    if (op.kind === 'create') {
+                        const onServer = transactions.find(t => t.uid === op.uid && t.id > 0);
+                        if (onServer && onServer.id !== op.id) remapId(op.id, onServer.id, '', op.uid); // قبلاً رسیده بود
+                        let tx = findTarget(op);
+                        if (!tx) {
+                            tx = { id: op.id, uid: op.uid, date: op.date || ymd(new Date()) };
+                            transactions.unshift(tx);
+                        }
+                        Object.assign(tx, fromP(op.p));
+                        tx.uid = op.uid;
+                    } else if (op.kind === 'update') {
+                        const tx = findTarget(op);
+                        if (tx) Object.assign(tx, fromP(op.p));
+                    } else if (op.kind === 'delete') {
+                        const tx = findTarget(op);
+                        if (tx) transactions = transactions.filter(t => t !== tx);
+                    }
                 });
+                const minId = transactions.reduce((m, t) => Math.min(m, t.id), 0);
+                tmpCounter = Math.min(-1, minId - 1);
                 refreshPendingIds();
+                saveQueue();
             })();
 
-            window.addEventListener('online', () => { renderNetBar(); flushQueue(); });
+            window.addEventListener('online', () => { lastSyncError = ''; flushQueue(); });
             window.addEventListener('offline', renderNetBar);
-            document.addEventListener('visibilitychange', () => { if (!document.hidden) flushQueue(); });
-            document.getElementById('net-sync-btn').addEventListener('click', flushQueue);
-            setInterval(flushQueue, 30000);
+            // وقتی اپ بسته/پنهان می‌شود، باقی‌ماندهٔ صف با keepalive فرستاده و کش ذخیره می‌شود
+            document.addEventListener('visibilitychange', () => {
+                if (document.hidden) { saveCacheNow(); flushQueue({ keepalive: true }); }
+                else flushQueue();
+            });
+            window.addEventListener('pagehide', () => { saveCacheNow(); flushQueue({ keepalive: true }); });
+            $('net-sync-btn').addEventListener('click', () => {
+                if (authError) { saveCacheNow(); location.reload(); return; }
+                lastSyncError = '';
+                flushQueue({ force: true });
+            });
+            setInterval(() => flushQueue(), 20000);
 
             // سرویس‌ورکر: صفحه بدون اینترنت هم باز می‌شود
             if ('serviceWorker' in navigator) {
@@ -2669,7 +2929,7 @@ function finance_tracker_shortcode_render() {
             }
 
             setTab('sarina');
-            saveCache();
+            saveCacheNow();
             flushQueue();
         });
     </script>
