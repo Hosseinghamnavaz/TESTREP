@@ -942,6 +942,7 @@ function finance_tracker_shortcode_render() {
         }
         .finance-app-wrapper .tx-avatar.in { background: rgba(74,222,128,0.16); color: var(--income-color); }
         .finance-app-wrapper .tx-avatar.out { background: rgba(248,113,113,0.14); color: var(--expense-color); }
+        .finance-app-wrapper .tx-avatar.letter { font-size: 1.05rem; color: inherit; }
         .finance-app-wrapper .tx-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
         .finance-app-wrapper .tx-desc {
             font-size: 0.92rem; font-weight: 600; line-height: 1.5;
@@ -1523,6 +1524,37 @@ function finance_tracker_shortcode_render() {
                 return (m && m[2]) ? { icon: m[1], label: m[2] } : { icon: '', label: s };
             }
 
+            /* آیکون کنار هر تراکنش: ایموجی خودش، یا حدس از روی موارد آماده (مثلاً «خرید از سوپر» ← 🛒)،
+               یا انتقال بین دو نفر ⇄، وگرنه حرف اول عنوان */
+            let iconGuess = null;
+            function buildIconGuess() {
+                const list = [];
+                [...tagsOf('main'), ...tagsOf('inst'), ...Object.keys(PEOPLE).map(p => TRANSFER_PREFIX + PEOPLE[p])].forEach(t => {
+                    const pr = splitIcon(t);
+                    const k = normText(pr.label);
+                    if (pr.icon && k.length >= 2) list.push({ k: k, icon: pr.icon });
+                    const short = k.replace(/^(اقساط|قسط) /, ''); // «قسط تارا» هم با «اقساط تارا» جور شود
+                    if (pr.icon && short !== k && short.length >= 3) list.push({ k: short, icon: pr.icon });
+                });
+                return list.sort((a, b) => b.k.length - a.k.length); // دقیق‌ترین (طولانی‌ترین) اول
+            }
+            function avatarFor(desc) {
+                const parts = splitIcon(desc);
+                if (parts.icon) return { text: parts.icon, letter: false };
+                const d = normText(parts.label);
+                if (/^(پرداختی به|دریافتی از) /.test(d)) return { text: '⇄', letter: false };
+                if (!iconGuess) iconGuess = buildIconGuess();
+                const hit = iconGuess.find(g => d.indexOf(g.k) >= 0);
+                if (hit) return { text: hit.icon, letter: false };
+                const ch = Array.from(d.replace(/[^\p{L}\p{N}]/gu, ''))[0];
+                return { text: ch || '•', letter: true };
+            }
+            function paintAvatar(el, tx) {
+                const av = avatarFor(tx.desc);
+                el.className = 'tx-avatar ' + (tx.type === 'income' ? 'in' : 'out') + (av.letter ? ' letter' : '');
+                el.textContent = av.text;
+            }
+
             /* یک ردیف تراکنش (مشترک بین نمای روزانه، دسته‌بندی، رویداد و اقساط) */
             function txRowHtml(item, opts) {
                 opts = opts || {};
@@ -1539,7 +1571,7 @@ function finance_tracker_shortcode_render() {
                     (pend ? '<span class="pending-badge" title="در حال ذخیره روی سرور">⏳</span>' : '');
                 return '<div class="transaction-item' + (picked ? ' picked' : '') + (pend ? ' pending' : '') + '" data-tx="' + item.id + '">' +
                     '<input type="checkbox" class="tx-check" data-check="' + item.id + '"' + (picked ? ' checked' : '') + '>' +
-                    '<span class="tx-avatar ' + (inc ? 'in' : 'out') + '">' + (parts.icon ? esc(parts.icon) : (inc ? '▲' : '▼')) + '</span>' +
+                    (av => '<span class="tx-avatar ' + (inc ? 'in' : 'out') + (av.letter ? ' letter' : '') + '">' + esc(av.text) + '</span>')(avatarFor(item.desc)) +
                     '<div class="tx-info">' +
                         '<span class="tx-desc">' + esc(title) + '</span>' +
                         '<div class="tx-meta">' + meta + '</div>' +
@@ -1995,9 +2027,7 @@ function finance_tracker_shortcode_render() {
                 const inc = tx.type === 'income';
                 const parts = splitIcon(tx.desc);
                 const g = groupOf(id);
-                const av = $('txm-avatar');
-                av.className = 'tx-avatar ' + (inc ? 'in' : 'out');
-                av.textContent = parts.icon || (inc ? '▲' : '▼');
+                paintAvatar($('txm-avatar'), tx);
                 $('txm-title').textContent = parts.label;
                 $('txm-sub').textContent = [dateLabel(tx.date), PEOPLE[tx.person] || '', g ? '🧳 ' + g : '', isPending(id) ? '⏳ در حال ذخیره' : ''].filter(Boolean).join('  |  ');
                 const am = $('txm-amount');
@@ -2040,9 +2070,7 @@ function finance_tracker_shortcode_render() {
                 const inc = tx.type === 'income';
                 const parts = splitIcon(tx.desc);
                 $('saved-title').textContent = kind === 'edit' ? 'ویرایش ذخیره شد' : 'ثبت شد';
-                const av = $('sv-avatar');
-                av.className = 'tx-avatar ' + (inc ? 'in' : 'out');
-                av.textContent = parts.icon || (inc ? '▲' : '▼');
+                paintAvatar($('sv-avatar'), tx);
                 $('sv-desc').textContent = parts.label;
                 $('sv-sub').textContent = [inc ? 'درآمد' : 'مخارج', PEOPLE[tx.person] || '', dateLabel(tx.date)].filter(Boolean).join('  |  ');
                 const am = $('sv-amount');
@@ -2373,6 +2401,7 @@ function finance_tracker_shortcode_render() {
             }
 
             function renderTags() {
+                iconGuess = null;
                 renderTagItems();
                 const del = $('tag-del-btn');
                 if (del) {
@@ -2680,8 +2709,8 @@ function finance_tracker_shortcode_render() {
                     const g = groups[k];
                     g.items.sort((a, b) => b.date.localeCompare(a.date) || b.id - a.id);
                     const parts = [];
-                    if (g.income > 0) parts.push('<span class="text-green">▲ ' + fmt(g.income) + '</span>');
-                    if (g.expense > 0) parts.push('<span class="text-red">▼ ' + fmt(g.expense) + '</span>');
+                    if (g.income > 0) parts.push('<span class="text-green">+' + fmt(g.income) + '</span>');
+                    if (g.expense > 0) parts.push('<span class="text-red">-' + fmt(g.expense) + '</span>');
                     frag.appendChild(makeDetails('c:' + k, isOpen('c:' + k, false),
                         '<span>' + esc(g.name) + '<span class="cat-sub">' + plain.format(g.items.length) + ' بار</span></span>' +
                         '<div class="day-summary-text">' + parts.join('') + '</div>',
@@ -2776,8 +2805,8 @@ function finance_tracker_shortcode_render() {
                 sortedDates.forEach((date, idx) => {
                     const dayData = groupedData[date];
                     let summaryText = '';
-                    if (currentFilter !== 'expense' && (dayData.income > 0 || currentFilter === 'income')) summaryText += `<span class="text-green">▲ ${fmt(dayData.income)}</span>`;
-                    if (currentFilter !== 'income' && (dayData.expense > 0 || currentFilter === 'expense')) summaryText += `<span class="text-red">▼ ${fmt(dayData.expense)}</span>`;
+                    if (currentFilter !== 'expense' && (dayData.income > 0 || currentFilter === 'income')) summaryText += `<span class="text-green">+${fmt(dayData.income)}</span>`;
+                    if (currentFilter !== 'income' && (dayData.expense > 0 || currentFilter === 'expense')) summaryText += `<span class="text-red">-${fmt(dayData.expense)}</span>`;
                     frag.appendChild(makeDetails('d:' + date, isOpen('d:' + date, idx === 0),
                         '<span>' + dayTitle(date) + '<span class="cat-sub">' + plain.format(dayData.items.length) + ' مورد</span></span>' +
                         '<div class="day-summary-text">' + summaryText + '</div>',
@@ -2802,8 +2831,8 @@ function finance_tracker_shortcode_render() {
                 $('sum-count').textContent = plain.format(list.length) + ' مورد انتخاب شده';
                 $('sum-net').innerHTML = '<b class="' + (net >= 0 ? 'text-green' : 'text-red') + '">' + (net < 0 ? '-' : '') + fmt(Math.abs(net)) + '</b> تومان';
                 $('sum-detail').innerHTML =
-                    '<span class="text-green">▲ درآمد: ' + fmt(inc) + '</span>' +
-                    '<span class="text-red">▼ هزینه: ' + fmt(exp) + '</span>';
+                    '<span class="text-green">درآمد: +' + fmt(inc) + '</span>' +
+                    '<span class="text-red">هزینه: -' + fmt(exp) + '</span>';
             }
 
             function setSelectMode(on) {
@@ -2946,8 +2975,8 @@ function finance_tracker_shortcode_render() {
                     g.items.sort((a, b) => b.date.localeCompare(a.date) || b.id - a.id);
                     const net = g.income - g.expense;
                     const parts = [];
-                    if (g.income > 0) parts.push('<span class="text-green">▲ ' + fmt(g.income) + '</span>');
-                    if (g.expense > 0) parts.push('<span class="text-red">▼ ' + fmt(g.expense) + '</span>');
+                    if (g.income > 0) parts.push('<span class="text-green">+' + fmt(g.income) + '</span>');
+                    if (g.expense > 0) parts.push('<span class="text-red">-' + fmt(g.expense) + '</span>');
                     parts.push('<b class="' + (net >= 0 ? 'text-green' : 'text-red') + '">' + (net < 0 ? '-' : '') + fmt(Math.abs(net)) + '</b>');
                     frag.appendChild(makeDetails('g:' + k, isOpen('g:' + k, false),
                         '<span>' + (k.indexOf('—') === 0 ? esc(k) : '🧳 ' + esc(k)) +
