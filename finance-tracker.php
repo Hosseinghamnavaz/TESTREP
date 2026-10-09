@@ -1,5 +1,15 @@
 <?php
 
+/*
+ * اگر نسخهٔ دیگری از همین کد (مثلاً اسنیپت قدیمی) هم فعال باشد، به جای «خطای مهم» و از کار افتادن سایت،
+ * این نسخه کنار می‌کشد و در پیشخوان پیغام می‌دهد که نسخهٔ قدیمی را غیرفعال کنید.
+ */
+if (function_exists('wp_finance_setup')) {
+    add_action('admin_notices', function () {
+        echo '<div class="notice notice-error"><p><b>مدیریت مالی:</b> نسخهٔ قدیمی کد هنوز فعال است. '
+           . 'اسنیپت (یا کد داخل functions.php) قدیمی را غیرفعال یا حذف کنید تا نسخهٔ جدید اجرا شود.</p></div>';
+    });
+} else {
 
 /**
  * ۱. ایجاد جداول دیتابیس (تراکنش‌ها + اقساط) و تنظیم رمز عبور هش شده
@@ -2988,3 +2998,5 @@ function finance_tracker_shortcode_render() {
     <?php
     return ob_get_clean();
 }
+
+} // پایان: if (function_exists('wp_finance_setup'))
