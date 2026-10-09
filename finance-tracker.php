@@ -1038,7 +1038,35 @@ function finance_tracker_shortcode_render() {
         .finance-app-wrapper #submit-btn:active { background: #22c55e; }
         .finance-app-wrapper.light #submit-btn { background: #16a34a; color: #fff; box-shadow: 0 8px 22px rgba(22,163,74,0.3); }
 
-        /* پیام کوتاه «ثبت شد» */
+        /* مودال «ثبت شد» */
+        .finance-app-wrapper .saved-check {
+            width: 64px; height: 64px; margin: 0 auto 12px; border-radius: 50%;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 2rem; font-weight: bold; background: #4ade80; color: #052e16;
+            animation: sv-pop 0.35s ease;
+        }
+        .finance-app-wrapper .saved-box h4 { color: #4ade80; margin-bottom: 14px; }
+        .finance-app-wrapper .saved-card { display: flex; align-items: center; gap: 10px; text-align: right; padding: 12px; margin-bottom: 10px; border-radius: 14px; background: rgba(255,255,255,0.06); border: 1px solid var(--glass-border); }
+        .finance-app-wrapper .saved-card .sv-text { flex: 1; min-width: 0; }
+        .finance-app-wrapper .saved-card .sv-desc { font-weight: bold; overflow-wrap: anywhere; }
+        .finance-app-wrapper .saved-card .sv-sub { font-size: 0.78rem; opacity: 0.75; margin-top: 3px; }
+        .finance-app-wrapper .saved-card .sv-amount { flex: none; white-space: nowrap; }
+        .finance-app-wrapper .saved-extra { font-size: 0.82rem; opacity: 0.85; margin-bottom: 8px; line-height: 1.7; }
+        .finance-app-wrapper .saved-extra:empty { display: none; }
+        .finance-app-wrapper .saved-status { font-size: 0.8rem; opacity: 0.8; margin-bottom: 16px; }
+        .finance-app-wrapper .saved-status.ok { color: #4ade80; opacity: 1; }
+        .finance-app-wrapper .saved-timer { height: 3px; margin-top: 14px; border-radius: 3px; overflow: hidden; background: rgba(255,255,255,0.1); }
+        .finance-app-wrapper .saved-timer span { display: block; height: 100%; width: 100%; background: #4ade80; }
+        .finance-app-wrapper .saved-timer span.run { animation: sv-shrink 3s linear forwards; }
+        .finance-app-wrapper.light .saved-check { background: #16a34a; color: #fff; }
+        .finance-app-wrapper.light .saved-box h4, .finance-app-wrapper.light .saved-status.ok { color: #16a34a; }
+        .finance-app-wrapper.light .saved-card { background: rgba(15,23,42,0.04); }
+        .finance-app-wrapper.light .saved-timer { background: rgba(15,23,42,0.08); }
+        .finance-app-wrapper.light .saved-timer span { background: #16a34a; }
+        @keyframes sv-pop { 0% { transform: scale(0.5); opacity: 0; } 70% { transform: scale(1.1); opacity: 1; } 100% { transform: scale(1); } }
+        @keyframes sv-shrink { from { width: 100%; } to { width: 0; } }
+
+        /* پیام کوتاه */
         .finance-app-wrapper .toast {
             position: fixed; left: 50%; top: calc(14px + env(safe-area-inset-top, 0px));
             transform: translate(-50%, -16px); opacity: 0; pointer-events: none;
@@ -1370,6 +1398,28 @@ function finance_tracker_shortcode_render() {
                     <button class="modal-btn success" id="group-save-btn">💾 ثبت</button>
                 </div>
                 <button type="button" class="ghost-btn" id="group-remove-btn" style="width:100%;">🚫 بیرون آوردن از رویداد</button>
+            </div>
+        </div>
+
+        <!-- مودال «ثبت شد» (ثبت جدید و ویرایش) -->
+        <div class="modal-overlay" id="saved-modal">
+            <div class="modal-box saved-box">
+                <div class="saved-check">✓</div>
+                <h4 id="saved-title">ثبت شد</h4>
+                <div class="saved-card">
+                    <span class="tx-avatar" id="sv-avatar"></span>
+                    <div class="sv-text">
+                        <div class="sv-desc" id="sv-desc"></div>
+                        <div class="sv-sub" id="sv-sub"></div>
+                    </div>
+                    <b class="sv-amount" id="sv-amount"></b>
+                </div>
+                <div class="saved-extra" id="sv-extra"></div>
+                <div class="saved-status" id="sv-status"></div>
+                <div class="modal-buttons">
+                    <button type="button" class="modal-btn success" id="sv-ok">باشه</button>
+                </div>
+                <div class="saved-timer"><span id="sv-bar"></span></div>
             </div>
         </div>
 
@@ -1756,6 +1806,7 @@ function finance_tracker_shortcode_render() {
             }
 
             function renderNetBar() {
+                if (typeof renderSavedStatus === 'function') renderSavedStatus();
                 const bar = $('net-bar');
                 const txt = $('net-bar-text');
                 const btn = $('net-sync-btn');
@@ -1970,6 +2021,50 @@ function finance_tracker_shortcode_render() {
                 });
             });
 
+            /* ---------- مودال «ثبت شد» ---------- */
+            const SAVED_MS = 3000;
+            let savedTx = null, savedTimer = null;
+            function txKey(tx) { return tx.uid ? 'u' + tx.uid : 'i' + tx.id; }
+            function renderSavedStatus() {
+                if (!savedTx) return;
+                const el = $('sv-status');
+                const waiting = pendingOps.some(o => targetKey(o) === txKey(savedTx));
+                const offline = (typeof navigator !== 'undefined' && navigator.onLine === false);
+                el.classList.toggle('ok', !waiting);
+                el.textContent = !waiting ? '✓ روی سرور ذخیره شد'
+                    : offline ? '📴 آفلاین؛ روی گوشی ذخیره شد و با وصل‌شدن نت ارسال می‌شود'
+                    : '⏳ در حال ذخیره روی سرور...';
+            }
+            function showSaved(tx, kind, extra) {
+                savedTx = tx;
+                const inc = tx.type === 'income';
+                const parts = splitIcon(tx.desc);
+                $('saved-title').textContent = kind === 'edit' ? 'ویرایش ذخیره شد' : 'ثبت شد';
+                const av = $('sv-avatar');
+                av.className = 'tx-avatar ' + (inc ? 'in' : 'out');
+                av.textContent = parts.icon || (inc ? '▲' : '▼');
+                $('sv-desc').textContent = parts.label;
+                $('sv-sub').textContent = [inc ? 'درآمد' : 'مخارج', PEOPLE[tx.person] || '', dateLabel(tx.date)].filter(Boolean).join('  |  ');
+                const am = $('sv-amount');
+                am.className = 'sv-amount ' + (inc ? 'text-green' : 'text-red');
+                am.textContent = (inc ? '+' : '-') + fmt(tx.amount) + ' تومان';
+                $('sv-extra').textContent = extra || '';
+                renderSavedStatus();
+                const bar = $('sv-bar');
+                bar.classList.remove('run');
+                void bar.offsetWidth; // شروع دوبارهٔ انیمیشن نوار
+                bar.classList.add('run');
+                $('saved-modal').classList.add('active');
+                clearTimeout(savedTimer);
+                savedTimer = setTimeout(closeSaved, SAVED_MS); // خودش بسته می‌شود تا ثبت پشت‌سرهم کند نشود
+            }
+            function closeSaved() {
+                clearTimeout(savedTimer);
+                savedTx = null;
+                $('saved-modal').classList.remove('active');
+            }
+            $('sv-ok').addEventListener('click', closeSaved);
+
             /* ---------- ویرایش / حذف تراکنش ---------- */
             window.editTx = function(id) {
                 const tx = transactions.find(t => t.id === id);
@@ -2101,7 +2196,7 @@ function finance_tracker_shortcode_render() {
                     queueUpsert(tx);
                 }
                 window.closeEditModal();
-                toast('✓ ذخیره شد');
+                if (tx) showSaved(tx, 'edit');
                 updateUI();
             });
             [emAmount, emDesc].forEach(el => el.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); emSave.click(); } }));
@@ -2411,10 +2506,11 @@ function finance_tracker_shortcode_render() {
                 const id = nextTmpId();
                 const uid = newUid();
                 const date = ymd(new Date());
-                transactions.unshift({ id: id, uid: uid, person: person, type: type, amount: amount, desc: desc, date: date });
+                const tx = { id: id, uid: uid, person: person, type: type, amount: amount, desc: desc, date: date };
+                transactions.unshift(tx);
                 enqueue({ v: 2, kind: 'create', id: id, uid: uid, date: date, at: Date.now(), p: { person: person, type: type, amount: amount, desc: desc } });
                 scheduleCacheSave();
-                return id;
+                return tx;
             }
 
             $('transaction-form').addEventListener('submit', function(e) {
@@ -2433,15 +2529,16 @@ function finance_tracker_shortcode_render() {
                     return;
                 }
 
-                addTransactionLocally(person, type, amount, desc);
+                const tx = addTransactionLocally(person, type, amount, desc);
                 const mir = transferMirror(person, type, desc);
                 if (mir) addTransactionLocally(mir.person, mir.type, amount, mir.desc);
 
                 amountInput.value = '';
                 descInput.value = '';
+                setTxType('expense'); // نوع خودکارِ مورد آماده (مثلاً درآمد) به ثبت بعدی منتقل نشود
                 resetTagPick();
                 if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
-                toast('✓ ثبت شد — ' + fmt(amount) + ' تومان');
+                showSaved(tx, 'new', mir ? '⇄ برای ' + PEOPLE[mir.person] + ' هم «' + mir.desc + '» ثبت شد.' : '');
                 updateUI();
             });
 
