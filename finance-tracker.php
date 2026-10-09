@@ -96,6 +96,8 @@ function finance_pwa_tags() {
 
     echo '<link rel="manifest" href="' . esc_url($ajax . '?action=finance_manifest&u=' . rawurlencode($page)) . '">' . "\n";
     echo '<link rel="apple-touch-icon" href="' . esc_url($ajax . '?action=finance_icon&size=180') . '">' . "\n";
+    // بدون این متا، بعضی قالب‌ها صفحه را در موبایل با عرض ۹۸۰ نشان می‌دهند و نمای موبایل فعال نمی‌شود
+    echo '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">' . "\n";
     echo '<meta name="mobile-web-app-capable" content="yes">' . "\n";
     echo '<meta name="apple-mobile-web-app-capable" content="yes">' . "\n";
     echo '<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">' . "\n";
@@ -849,7 +851,7 @@ function finance_tracker_shortcode_render() {
         }
         .finance-app-wrapper.light .sheet-close { background: rgba(15,23,42,0.08); color: #0f172a; }
 
-        @media (max-width: 640px) {
+        @media (max-width: 640px), (hover: none) and (pointer: coarse) and (max-width: 1024px) {
             /* مودال‌ها هم روی موبایل به شکل شیت پایین */
             .finance-app-wrapper .modal-overlay.active { align-items: flex-end; }
             .finance-app-wrapper .modal-box {
@@ -1023,7 +1025,7 @@ function finance_tracker_shortcode_render() {
         .finance-app-wrapper .cat-dd-panel.dd-sheet .tag-done { display: block; }
         .finance-app-wrapper .cat-dd-panel.dd-sheet .tag-grid { max-height: 44vh; }
         .finance-app-wrapper #add-tag-modal { z-index: 10002; } /* بالای شیت باز شود */
-        @media (max-width: 640px) {
+        @media (max-width: 640px), (hover: none) and (pointer: coarse) and (max-width: 1024px) {
             .finance-app-wrapper .desc-trigger { display: flex; }
             .finance-app-wrapper .desc-dd > .cat-dd-panel.tag-box { display: none; }
         }
@@ -1408,7 +1410,9 @@ function finance_tracker_shortcode_render() {
             const MONTHS = ['فروردین','اردیبهشت','خرداد','تیر','مرداد','شهریور','مهر','آبان','آذر','دی','بهمن','اسفند'];
 
             const $ = id => document.getElementById(id);
-            const isMobile = () => window.matchMedia('(max-width: 640px)').matches;
+            // گوشی: یا صفحهٔ باریک، یا صفحهٔ لمسی (حتی اگر قالب متای viewport نداشته باشد و عرض را ۹۸۰ نشان دهد)
+            const MOBILE_MQ = window.matchMedia('(max-width: 640px), (hover: none) and (pointer: coarse) and (max-width: 1024px)');
+            const isMobile = () => MOBILE_MQ.matches;
             const appRoot = document.querySelector('.finance-app-wrapper');
             const amountInput = $('amount');
             const descInput = $('desc');
