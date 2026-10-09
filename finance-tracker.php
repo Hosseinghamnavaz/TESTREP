@@ -978,7 +978,7 @@ function finance_tracker_shortcode_render() {
 
         /* ===== موارد آماده: فیلد دستی + دکمه‌های دوتایی ===== */
         .finance-app-wrapper .tag-box { margin-bottom: 15px; padding: 12px; border-radius: 16px; background: rgba(0,0,0,0.18); border: 1px solid var(--glass-border); }
-        .finance-app-wrapper .tag-box-label { font-size: 0.8rem; opacity: 0.75; margin: 12px 2px 8px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+        .finance-app-wrapper .tag-box-label { font-size: 0.8rem; opacity: 0.75; margin: 0 2px 8px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
         .finance-app-wrapper .desc-wrap { position: relative; }
         .finance-app-wrapper .desc-wrap input { padding-left: 40px; }
         .finance-app-wrapper .desc-clear { position: absolute; left: 6px; top: 50%; transform: translateY(-50%); width: 30px; height: 30px; padding: 0; margin: 0; border: none; border-radius: 50%; background: rgba(255,255,255,0.12); color: inherit; cursor: pointer; display: none; font-size: 0.8rem; line-height: 30px; }
@@ -1015,14 +1015,13 @@ function finance_tracker_shortcode_render() {
         .finance-app-wrapper.light .desc-dd > .cat-dd-panel.tag-box { background: rgba(15,23,42,0.04); }
         .finance-app-wrapper .desc-trigger {
             display: none; align-items: center; justify-content: space-between; gap: 10px;
-            margin: 0 0 15px; text-align: right; cursor: pointer; color: inherit;
+            margin: 0 0 15px; text-align: right; cursor: pointer; color: inherit; font-weight: bold;
+            background: rgba(251,191,36,0.12); border-color: rgba(251,191,36,0.35);
         }
-        .finance-app-wrapper .desc-trigger > span:first-child { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .finance-app-wrapper .desc-trigger.empty > span:first-child { opacity: 0.6; }
-        .finance-app-wrapper.light .desc-trigger { background: rgba(255,255,255,0.85); color: #0f172a; }
-        .finance-app-wrapper .tag-done { display: none; margin: 12px 0 0; padding: 13px; border: none; font-weight: bold; background: #4ade80; color: #052e16; cursor: pointer; }
-        .finance-app-wrapper.light .tag-done { background: #16a34a; color: #fff; }
-        .finance-app-wrapper .cat-dd-panel.dd-sheet .tag-done { display: block; }
+        .finance-app-wrapper.light .desc-trigger { background: rgba(245,158,11,0.12); border-color: rgba(245,158,11,0.4); color: #0f172a; }
+        .finance-app-wrapper .tag-search { display: none; }
+        .finance-app-wrapper .cat-dd-panel.dd-sheet .tag-search { display: block; margin-bottom: 12px; }
+        .finance-app-wrapper .cat-dd-panel.dd-sheet .tag-box-label { display: none; }
         .finance-app-wrapper .cat-dd-panel.dd-sheet .tag-grid { max-height: 44vh; }
         .finance-app-wrapper #add-tag-modal { z-index: 10002; } /* بالای شیت باز شود */
         @media (max-width: 640px), (hover: none) and (pointer: coarse) and (max-width: 1024px) {
@@ -1148,18 +1147,19 @@ function finance_tracker_shortcode_render() {
                     <div class="form-group">
                         <input type="text" id="amount" inputmode="numeric" placeholder="مبلغ (تومان)" autocomplete="off">
                     </div>
+                    <div class="form-group desc-wrap" id="desc-wrap">
+                        <input type="text" id="desc" placeholder="✍️ بابت چی بود؟" autocomplete="off" enterkeyhint="done">
+                        <button type="button" class="desc-clear" id="desc-clear" title="پاک کردن">✕</button>
+                    </div>
                     <div class="cat-dd desc-dd" id="tag-dd">
-                    <!-- موبایل: فقط این دکمه در فرم است و موارد آماده به صورت شیت پایین باز می‌شود -->
-                    <button type="button" class="desc-trigger empty" id="tag-dd-btn">
-                        <span id="tag-dd-current">✍️ بابت چی بود؟</span>
-                        <span class="cat-dd-caret">▾</span>
+                    <!-- موبایل: این دکمه موارد آماده را به صورت شیت پایین باز می‌کند؛ دسکتاپ: موارد زیر فیلد دیده می‌شوند -->
+                    <button type="button" class="desc-trigger" id="tag-dd-btn">
+                        <span>📋 موارد آماده</span>
+                        <span class="qt-go">‹</span>
                     </button>
                     <div class="cat-dd-panel tag-box" id="tag-box">
-                        <div class="sheet-title"><span>بابت چی بود؟</span><button type="button" class="sheet-close">بستن</button></div>
-                        <div class="desc-wrap" id="desc-wrap">
-                            <input type="text" id="desc" placeholder="✍️ بابت چی بود؟ بنویسید یا انتخاب کنید" autocomplete="off" enterkeyhint="done">
-                            <button type="button" class="desc-clear" id="desc-clear" title="پاک کردن">✕</button>
-                        </div>
+                        <div class="sheet-title"><span>📋 موارد آماده</span><button type="button" class="sheet-close">بستن</button></div>
+                        <input type="text" id="tag-search" class="cat-search tag-search" placeholder="🔍 جستجو..." autocomplete="off">
                         <div class="tag-box-label"><span>موارد آماده</span></div>
                         <div class="tag-head" id="tag-head" style="display:none;">
                             <button type="button" class="tag-back" id="tag-back-btn">→ بازگشت</button>
@@ -1170,7 +1170,6 @@ function finance_tracker_shortcode_render() {
                             <button type="button" class="dd-act" id="tag-add-btn">➕ جدید</button>
                             <button type="button" class="dd-act" id="tag-del-btn">🗑 حذف</button>
                         </div>
-                        <button type="button" class="tag-done" id="tag-done-btn">✓ تأیید</button>
                     </div>
                     </div>
                     <button type="submit" id="submit-btn">ثبت تراکنش</button>
@@ -2204,13 +2203,12 @@ function finance_tracker_shortcode_render() {
             }
 
             function syncDescWrap() {
-                const v = descInput.value.trim();
                 $('desc-wrap').classList.toggle('has-val', descInput.value !== '');
-                $('tag-dd-current').textContent = v || '✍️ بابت چی بود؟';
-                $('tag-dd-btn').classList.toggle('empty', !v);
             }
+            const tagSearch = $('tag-search');
             const descSheetOpen = () => $('tag-dd').classList.contains('open') && isMobile();
             function openDescSheet() {
+                tagSearch.value = '';
                 openDd($('tag-dd'));
                 renderTags();
             }
@@ -2255,8 +2253,8 @@ function finance_tracker_shortcode_render() {
             function renderTagItems() {
                 const box = $('tag-items');
                 if (!box) return;
-                // اگر کاربر خودش می‌نویسد، موارد آماده با همان متن فیلتر می‌شوند
-                const f = pickedTag ? '' : normText(descInput.value);
+                // در شیت موبایل با جستجوی خود شیت؛ در دسکتاپ با متنی که در «بابت چی بود؟» نوشته شده
+                const f = descSheetOpen() ? normText(tagSearch.value) : (pickedTag ? '' : normText(descInput.value));
                 const hit = t => normText(t).indexOf(f) >= 0;
                 const inst = tagsOf('inst');
                 const inSub = tagView === 'inst';
@@ -2271,7 +2269,7 @@ function finance_tracker_shortcode_render() {
 
                 box.innerHTML = '';
                 if (!list.length) {
-                    box.innerHTML = '<div class="tag-empty">' + (f ? '✍️ همین متنی که نوشتید ثبت می‌شود' : 'موردی وجود ندارد؛ با «➕» اضافه کنید') + '</div>';
+                    box.innerHTML = '<div class="tag-empty">' + (!f ? 'موردی وجود ندارد؛ با «➕» اضافه کنید' : descSheetOpen() ? 'موردی پیدا نشد' : '✍️ همین متنی که نوشتید ثبت می‌شود') + '</div>';
                     return;
                 }
                 const frag = document.createDocumentFragment();
@@ -2306,11 +2304,8 @@ function finance_tracker_shortcode_render() {
                 e.stopPropagation();
                 openDescSheet();
             });
-            $('tag-done-btn').addEventListener('click', closeAllDd);
-            descInput.addEventListener('keydown', function(e) {
-                // داخل شیت، Enter فقط شیت را می‌بندد
-                if (e.key === 'Enter' && descSheetOpen()) { e.preventDefault(); descInput.blur(); closeAllDd(); }
-            });
+            tagSearch.addEventListener('input', renderTagItems);
+            tagSearch.addEventListener('keydown', function(e) { if (e.key === 'Enter') e.preventDefault(); });
             $('tag-back-btn').addEventListener('click', function() {
                 tagView = 'root';
                 renderTags();
@@ -2434,7 +2429,7 @@ function finance_tracker_shortcode_render() {
                 if (amount <= 0) { toast('مبلغ را وارد کنید'); amountInput.focus(); return; }
                 if (!desc) {
                     toast('بنویسید بابت چی بود یا یک مورد آماده انتخاب کنید');
-                    if (isMobile()) openDescSheet(); else descInput.focus();
+                    descInput.focus();
                     return;
                 }
 
